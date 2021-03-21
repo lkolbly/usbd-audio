@@ -108,16 +108,21 @@ mod tests {
             .with_spec_number_major(0)
             .with_spec_number_minor(0)
             .with_category(0xff)
-            .with_total_length(8 + 17*2 + 12*2)
+            .with_total_length(8 + 17 * 2 + 12 * 2)
             .with_latency_control(0)
             .into_bytes();
-        assert_eq!(desc, [
-            1, // Header
-            0x00, 0x00, // BCD ADC
-            0xff, // Category
-            8 + 17*2 + 12*2, 0x00, // Total length
-            0,    // Latency controls
-        ]);
+        assert_eq!(
+            desc,
+            [
+                1, // Header
+                0x00,
+                0x00, // BCD ADC
+                0xff, // Category
+                8 + 17 * 2 + 12 * 2,
+                0x00, // Total length
+                0,    // Latency controls
+            ]
+        );
     }
 
     #[test]
@@ -134,18 +139,21 @@ mod tests {
             .with_controls(InputTerminalControls::new())
             .with_terminal(0)
             .into_bytes();
-        assert_eq!(desc, [
-            2, // Input terminal
-            1, // Terminal ID (unique)
-            0x01, 0x01, // Terminal type
-            0,    // bAssocTerminal
-            2,    // bCSourceID
-            2,    // bNrChannels
-            0x3, 0, 0, 0, // bmChannelConfig (front left, front right)
-            0, // iChannelNames
-            0, 0, // bmControls
-            0, // iTerminal
-        ]);
+        assert_eq!(
+            desc,
+            [
+                2, // Input terminal
+                1, // Terminal ID (unique)
+                0x01, 0x01, // Terminal type
+                0,    // bAssocTerminal
+                2,    // bCSourceID
+                2,    // bNrChannels
+                0x3, 0, 0, 0, // bmChannelConfig (front left, front right)
+                0, // iChannelNames
+                0, 0, // bmControls
+                0, // iTerminal
+            ]
+        );
     }
 
     #[test]
@@ -159,16 +167,19 @@ mod tests {
             .with_clock_source_id(2)
             .with_name(0)
             .into_bytes();
-        assert_eq!(desc, [
-            3, // Output terminal
-            3, // Terminal ID (unique)
-            0x01, 0x03, // Terminal type
-            0, // bAssocTerminal
-            2, // Source ID
-            2, // Clock source
-            0, 0, // bmControls
-            0, // iTerminal
-        ]);
+        assert_eq!(
+            desc,
+            [
+                3, // Output terminal
+                3, // Terminal ID (unique)
+                0x01, 0x03, // Terminal type
+                0,    // bAssocTerminal
+                2,    // Source ID
+                2,    // Clock source
+                0, 0, // bmControls
+                0, // iTerminal
+            ]
+        );
     }
 
     #[test]
@@ -181,13 +192,16 @@ mod tests {
             .with_associated_terminal_id(1)
             .with_name(0)
             .into_bytes();
-        assert_eq!(desc, [
-            0xA, // CLOCK_SOURCE
-            2, // clock ID
-            0, // bmAttributes (external, not sync'd to SOF)
-            0, // bmControls (no controls present)
-            1, // bAssocTerminal
-            0, // iClockSource
-        ]);
+        assert_eq!(
+            desc,
+            [
+                0xA, // CLOCK_SOURCE
+                2,   // clock ID
+                0,   // bmAttributes (external, not sync'd to SOF)
+                0,   // bmControls (no controls present)
+                1,   // bAssocTerminal
+                0,   // iClockSource
+            ]
+        );
     }
 }
