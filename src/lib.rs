@@ -204,25 +204,24 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
         )?;
         writer.write(
             CS_INTERFACE,
-            &[
-                1, // AS_GENERAL
-                1, // bTerminalLink (terminal ID of output term)
-                0, // bmControls
-                1, // bFormatType (PCM)
-                0x1, 0x0, 0x0, 0x0, // bmFormats (PCM)
-                2,   // bNrChannels
-                0x3, 0, 0, 0, // bmChannelConfig
-                0, // iChannelNames
-            ],
+            &AudioStreamingInterface::new()
+                .with_subtype(StreamingSubtype::General)
+                .with_terminal_id(1)
+                .with_format_type(FormatType::Type1)
+                .with_formats(Formats::new().with_pcm(true))
+                .with_num_channels(2)
+                .with_channel_config(ChannelConfig::new().with_channels(3))
+                .with_channel_names(0)
+                .into_bytes(),
         )?;
         writer.write(
             CS_INTERFACE,
-            &[
-                0x02, // FORMAT_TYPE
-                0x01, // FORMAT_TYPE_I
-                2,    // bSubslotSize (1 byte samples)
-                16,   // bBitResolution (8 bits in byte used)
-            ],
+            &Type1Format::new()
+                .with_subtype(StreamingSubtype::FormatType)
+                .with_format_type(FormatType::Type1)
+                .with_subslot_size(2)
+                .with_bit_resolution(16)
+                .into_bytes(),
         )?;
 
         writer.endpoint(&self.data_ep)?;
@@ -230,13 +229,9 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
         // Class specific endpoint descriptor
         writer.write(
             0x25, // CS_ENDPOINT
-            &[
-                1, // EP_GENERAL
-                0, // bmAttributes
-                0, // bmControls
-                0, // bLockDelayUnits
-                0, 0, // wLockDelay
-            ],
+            &AudioStreamingEndpoint::new()
+                .with_subtype(EndpointDescriptorSubtype::General)
+                .into_bytes(),
         )?;
 
         // Setup the microphone streaming
@@ -248,25 +243,24 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
         )?;
         writer.write(
             CS_INTERFACE,
-            &[
-                1, // AS_GENERAL
-                4, // bTerminalLink (terminal ID of input term)
-                0, // bmControls
-                1, // bFormatType (PCM)
-                0x1, 0x0, 0x0, 0x0, // bmFormats (PCM)
-                1,   // bNrChannels
-                0x1, 0, 0, 0, // bmChannelConfig
-                0, // iChannelNames
-            ],
+            &AudioStreamingInterface::new()
+                .with_subtype(StreamingSubtype::General)
+                .with_terminal_id(4)
+                .with_format_type(FormatType::Type1)
+                .with_formats(Formats::new().with_pcm(true))
+                .with_num_channels(1)
+                .with_channel_config(ChannelConfig::new().with_channels(1))
+                .with_channel_names(0)
+                .into_bytes(),
         )?;
         writer.write(
             CS_INTERFACE,
-            &[
-                0x02, // FORMAT_TYPE
-                0x01, // FORMAT_TYPE_I
-                1,    // bSubslotSize (1 byte samples)
-                8,    // bBitResolution (8 bits in byte used)
-            ],
+            &Type1Format::new()
+                .with_subtype(StreamingSubtype::FormatType)
+                .with_format_type(FormatType::Type1)
+                .with_subslot_size(1)
+                .with_bit_resolution(8)
+                .into_bytes(),
         )?;
 
         writer.endpoint(&self.source_ep)?;
@@ -274,13 +268,9 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
         // Class specific endpoint descriptor
         writer.write(
             0x25, // CS_ENDPOINT
-            &[
-                1, // EP_GENERAL
-                0, // bmAttributes
-                0, // bmControls
-                0, // bLockDelayUnits
-                0, 0, // wLockDelay
-            ],
+            &AudioStreamingEndpoint::new()
+                .with_subtype(EndpointDescriptorSubtype::General)
+                .into_bytes(),
         )?;
 
         Ok(())

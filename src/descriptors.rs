@@ -22,6 +22,19 @@ pub enum Subtype {
     ClockSource = 0xA,
 }
 
+#[derive(BitfieldSpecifier)]
+#[bits = 8]
+pub enum StreamingSubtype {
+    General = 1,
+    FormatType = 2,
+}
+
+#[derive(BitfieldSpecifier)]
+#[bits = 8]
+pub enum EndpointDescriptorSubtype {
+    General = 1,
+}
+
 #[bitfield]
 pub struct AudioClass {
     pub subtype: Subtype, // Fixed at "HEADER" (1)
@@ -95,6 +108,74 @@ pub struct ClockSource {
     pub controls: B8,
     pub associated_terminal_id: B8,
     pub name: B8,
+}
+
+#[derive(BitfieldSpecifier)]
+#[bits = 8]
+pub enum FormatType {
+    Undefinted = 0,
+    Type1 = 1,
+    Type2 = 2,
+    Type3 = 3,
+    Type4 = 4,
+    ExtType1 = 0x81,
+    ExtType2 = 0x82,
+    ExtType3 = 0x83,
+}
+
+#[bitfield]
+#[derive(BitfieldSpecifier)]
+pub struct Formats {
+    pub pcm: bool,
+    pub pcm8: bool,
+    pub ieee_float: bool,
+    pub alaw: bool,
+    pub mulaw: bool,
+    reserved: B26,
+    pub type_1_raw_data: bool,
+}
+
+#[bitfield]
+pub struct AudioStreamingInterface {
+    pub subtype: StreamingSubtype,
+    pub terminal_id: B8,
+    pub active_alternate_setting: Control,
+    pub valid_alternate_setting: Control,
+    reserved_controls: B4,
+    pub format_type: FormatType,
+    pub formats: Formats,
+    pub num_channels: B8,
+    pub channel_config: ChannelConfig,
+    pub channel_names: B8,
+}
+
+#[bitfield]
+pub struct Type1Format {
+    pub subtype: StreamingSubtype,
+    pub format_type: FormatType,
+    pub subslot_size: B8,
+    pub bit_resolution: B8,
+}
+
+#[derive(BitfieldSpecifier)]
+#[bits = 8]
+pub enum LockDelayUnits {
+    Undefined = 0,
+    Milliseconds = 1,
+    DecodedPcmSamples = 2,
+}
+
+#[bitfield]
+pub struct AudioStreamingEndpoint {
+    pub subtype: EndpointDescriptorSubtype,
+    reserved_attributes: B7,
+    pub max_packets_only: bool,
+    pub pitch: Control,
+    pub data_overrun: Control,
+    pub data_underrun: Control,
+    reserved_controls: B2,
+    pub lock_delay_units: LockDelayUnits,
+    pub lock_delay: B16,
 }
 
 #[cfg(test)]
@@ -201,6 +282,51 @@ mod tests {
                 0,   // bmControls (no controls present)
                 1,   // bAssocTerminal
                 0,   // iClockSource
+            ]
+        );
+    }
+
+    #[test]
+    fn as_iface_descriptor_correct() {
+        let desc = AudioStreamingInterface::new()
+            .with_subtype(StreamingSubtype::General)
+            .with_terminal_id(1)
+            .with_format_type(FormatType::Type1)
+            .with_formats(Formats::new().with_pcm(true))
+            .with_num_channels(2)
+            .with_channel_config(ChannelConfig::new().with_channels(3))
+            .with_channel_names(0)
+            .into_bytes();
+        assert_eq!(
+            desc,
+            [
+                1, // AS_GENERAL
+                1, // bTerminalLink (terminal ID of output term)
+                0, // bmControls
+                1, // bFormatType (PCM)
+                0x1, 0x0, 0x0, 0x0, // bmFormats (PCM)
+                2,   // bNrChannels
+                0x3, 0, 0, 0, // bmChannelConfig
+                0, // iChannelNames
+            ]
+        );
+    }
+
+    #[test]
+    fn format_type_1_descriptor_correct() {
+        let desc = Type1Format::new()
+            .with_subtype(StreamingSubtype::FormatType)
+            .with_format_type(FormatType::Type1)
+            .with_subslot_size(2)
+            .with_bit_resolution(16)
+            .into_bytes();
+        assert_eq!(
+            desc,
+            [
+                0x02, // FORMAT_TYPE
+                0x01, // FORMAT_TYPE_I
+                2,    // bSubslotSize (1 byte samples)
+                16,   // bBitResolution (8 bits in byte used)
             ]
         );
     }
