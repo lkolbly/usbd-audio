@@ -105,7 +105,9 @@ pub struct ClockSource {
     pub clock_type: ClockType,
     pub sync_to_sof: bool,
     reserved_attributes: B5,
-    pub controls: B8,
+    pub frequency: Control,
+    pub validity: Control,
+    reserved_controls: B4,
     pub associated_terminal_id: B8,
     pub name: B8,
 }

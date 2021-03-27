@@ -32,7 +32,107 @@ impl ControlType {
     }
 }
 
-pub struct UsbAudio<'a, B: usb_device::bus::UsbBus> {
+trait ControlReplyWriter {
+    fn layout1_cur(self, value: u8);
+    fn layout2_cur(self, value: u16);
+    fn layout3_cur(self, value: u32);
+
+    fn layout1_range(self, ranges: &[ControlRange<u8>]);
+    fn layout2_range(self, ranges: &[ControlRange<u16>]);
+    fn layout3_range(self, ranges: &[ControlRange<u32>]);
+}
+
+impl<B: usb_device::bus::UsbBus> ControlReplyWriter for ControlIn<'_, '_, '_, B> {
+    fn layout1_cur(self, value: u8) {
+        self.accept_with(&[value])
+            .expect("Couldn't accept transfer!");
+    }
+
+    fn layout2_cur(self, value: u16) {
+        self.accept_with(&value.to_le_bytes())
+            .expect("Couldn't accept transfer");
+    }
+
+    fn layout3_cur(self, value: u32) {
+        self.accept_with(&value.to_le_bytes())
+            .expect("Couldn't accept transfer");
+    }
+
+    fn layout1_range(self, ranges: &[ControlRange<u8>]) {
+        accept_get_with(self, ranges).expect("Couldn't accept transfer");
+    }
+
+    fn layout2_range(self, ranges: &[ControlRange<u16>]) {
+        accept_get_with(self, ranges).expect("Couldn't accept transfer");
+    }
+
+    fn layout3_range(self, ranges: &[ControlRange<u32>]) {
+        accept_get_with(self, ranges).expect("Couldn't accept transfer");
+    }
+}
+
+trait ControlEntity {
+    fn entity_id(&self) -> u8;
+
+    fn get_cur<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W);
+    fn get_range<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W);
+}
+
+pub struct ClockSource {
+    entity_id: u8,
+}
+
+impl ClockSource {
+    pub fn new(entity_id: u8) -> ClockSource {
+        ClockSource { entity_id }
+    }
+
+    fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
+        let CS_INTERFACE = 0x24;
+        writer
+            .write(
+                CS_INTERFACE,
+                &descriptors::ClockSource::new()
+                    .with_subtype(Subtype::ClockSource)
+                    .with_clock_id(self.entity_id)
+                    .with_clock_type(ClockType::InternalFixed)
+                    .with_sync_to_sof(false)
+                    .with_associated_terminal_id(0)
+                    .with_name(0)
+                    .into_bytes(),
+            )
+            .unwrap();
+    }
+}
+
+impl ControlEntity for ClockSource {
+    fn entity_id(&self) -> u8 {
+        self.entity_id
+    }
+
+    fn get_cur<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W) {
+        if control_selector == 1 {
+            // CS_SAM_FREQ_CONTROL
+            reply_writer.layout3_cur(44_100);
+        } else {
+            // TODO: Handle unrecognized controls
+        }
+    }
+
+    fn get_range<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W) {
+        if control_selector == 1 {
+            reply_writer.layout3_range(&[ControlRange::<u32> {
+                min: 44100,
+                max: 44100,
+                res: 0,
+            }]);
+        } else {
+            // TODO: Handle unrecognized controls
+        }
+    }
+}
+
+pub struct UsbAudio<'a, 'b, B: usb_device::bus::UsbBus> {
     pub nbytes: usize,
     pub nbytes_sent: usize,
     pub iface: usb_device::class_prelude::InterfaceNumber,
@@ -40,13 +140,15 @@ pub struct UsbAudio<'a, B: usb_device::bus::UsbBus> {
     pub iface3: InterfaceNumber,
     pub data_ep: usb_device::endpoint::EndpointOut<'a, B>,
     pub source_ep: usb_device::endpoint::EndpointIn<'a, B>,
+    pub clocks: &'b [ClockSource],
 }
 
-impl<B: usb_device::bus::UsbBus> UsbAudio<'_, B> {
+impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
     pub fn new(
-        alloc: &usb_device::bus::UsbBusAllocator<B>,
+        alloc: &'a usb_device::bus::UsbBusAllocator<B>,
         max_packet_size: u16,
-    ) -> UsbAudio<'_, B> {
+        clocks: &'b [ClockSource],
+    ) -> UsbAudio<'a, 'b, B> {
         /*let mut data = [0; 100];
         for i in 0..100 {
             let x = (i as f32).sin() * 127.;
@@ -71,12 +173,13 @@ impl<B: usb_device::bus::UsbBus> UsbAudio<'_, B> {
                 64,
                 1,
             ),
+            clocks: clocks,
             //mic_data: data,
         }
     }
 }
 
-impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio<'a, B> {
+impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio<'a, 'b, B> {
     fn get_configuration_descriptors(
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
@@ -126,17 +229,9 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
                 .with_terminal(0)
                 .into_bytes(),
         )?;
-        writer.write(
-            CS_INTERFACE,
-            &ClockSource::new()
-                .with_subtype(Subtype::ClockSource)
-                .with_clock_id(2)
-                .with_clock_type(ClockType::External)
-                .with_sync_to_sof(false)
-                .with_associated_terminal_id(1)
-                .with_name(0)
-                .into_bytes(),
-        )?;
+        for clock in self.clocks.iter() {
+            clock.write_descriptor(writer);
+        }
 
         // Speakers
         writer.write(
@@ -146,7 +241,7 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
                 .with_terminal_id(3)
                 .with_terminal_type(0x0301)
                 .with_associated_terminal_id(0)
-                .with_source_id(2)
+                .with_source_id(1)
                 .with_clock_source_id(2)
                 .with_name(0)
                 .into_bytes(),
@@ -284,53 +379,36 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
             && req.recipient == usb_device::control::Recipient::Interface
         {
             let reqtype = ControlType::from(req.request);
-            let control_selector = req.value >> 8;
+            let control_selector = (req.value >> 8) as u8;
             let channel_number = req.value & 0xFF;
             let interface = req.index & 0xFF;
             let entity_id = req.index >> 8;
 
-            //log::info!("control: dir={:?} reqtype={:?} recip={:?} req={} value={} idx={} len={}", req.direction, req.request_type, req.recipient, req.request, req.value, req.index, req.length);
-            //if req.recipient == usb_device::control::Recipient::Interface && req.value == 256 && req.request == 2 && req.index == 514 {
-            if reqtype == ControlType::Range && entity_id == 2 {
-                accept_get_with(
-                    xfer,
-                    &[ControlRange::<u32> {
-                        min: 44100,
-                        max: 44100,
-                        res: 0,
-                    }],
-                )
-                .expect("Couldn't accept transfer!");
-            } else if reqtype == ControlType::Current && entity_id == 2 {
-                xfer.accept_with(&[
-                    0x44, 0xac, 0x00, 0x00, // CUR
-                ])
-                .expect("Couldn't accept transfer!");
-            } else if reqtype == ControlType::Range && entity_id == 4 {
-                accept_get_with(
-                    xfer,
-                    &[ControlRange::<u32> {
-                        min: 44100,
-                        max: 44100,
-                        res: 0,
-                    }],
-                )
-                .expect("Couldn't accept transfer!");
-            } else if reqtype == ControlType::Current && entity_id == 4 {
-                xfer.accept_with(&[
-                    0x44, 0xac, 0x00, 0x00, // CUR
-                ])
-                .expect("Couldn't accept transfer!");
-            } else {
-                log::info!(
-                    "unhandled audio GET: {:?} CS={} chan={} iface={} eid={}",
-                    reqtype,
-                    control_selector,
-                    channel_number,
-                    interface,
-                    entity_id
-                );
+            for control in self.clocks.iter() {
+                if control.entity_id() == entity_id as u8 {
+                    match reqtype {
+                        ControlType::Range => {
+                            control.get_range(control_selector, xfer);
+                        }
+                        ControlType::Current => {
+                            control.get_cur(control_selector, xfer);
+                        }
+                        _ => {
+                            panic!("Unrecognized ControlType request!");
+                        }
+                    }
+                    return;
+                }
             }
+
+            log::info!(
+                "unhandled audio GET: {:?} CS={} chan={} iface={} eid={}",
+                reqtype,
+                control_selector,
+                channel_number,
+                interface,
+                entity_id
+            );
         } else {
             log::info!(
                 "control: dir={:?} reqtype={:?} recip={:?} req={} value={} idx={} len={}",

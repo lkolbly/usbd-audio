@@ -130,6 +130,7 @@ fn main() -> ! {
         uart,
         mut dcdc,
         gpt1,
+        gpt2,
         adc,
         ..
     } = hal::Peripherals::take().unwrap();
@@ -154,6 +155,11 @@ fn main() -> ! {
     gpt1.set_enable(true);
 
     gpt1.set_output_compare_duration(GPT_OCR, BLINK_PERIOD);
+
+    let mut gpt2 = gpt2.clock(&mut cfg);
+
+    gpt2.set_mode(hal::gpt::Mode::FreeRunning);
+    gpt2.set_enable(true);
 
     // DMA initialization (for logging)
     let mut dma_channels = dma.clock(&mut ccm.handle);
@@ -228,7 +234,8 @@ fn main() -> ! {
     let bus_adapter = support::new_bus_adapter();
     let bus = usb_device::bus::UsbBusAllocator::new(bus_adapter);
 
-    let mut audio = UsbAudio::new(&bus, 768);
+    let clocks = [usbd_audio::ClockSource::new(2)];
+    let mut audio = UsbAudio::new(&bus, 768, &clocks);
     let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(0x5824, 0x27dd))
         .product("imxrt-usbd")
         .max_packet_size_0(64)
@@ -271,7 +278,7 @@ fn main() -> ! {
         loops += 1;
         time_elapse(&mut gpt1, || {
             let adc_samps = unsafe { adc_count.load(core::sync::atomic::Ordering::SeqCst) };
-            log::info!("Num bytes recv'd = {} sent = {} loops = {} ADC samps = {} min/max={}/{}", audio.nbytes, audio.nbytes_sent, loops, adc_samps, adc_min, adc_max);
+            log::info!("{} RX'd = {} TX'd = {} loops = {} ADC samps = {} min/max={}/{}", gpt2.count(), audio.nbytes, audio.nbytes_sent, loops, adc_samps, adc_min, adc_max);
             unsafe {
                 adc_count.store(0, core::sync::atomic::Ordering::SeqCst);
             }
