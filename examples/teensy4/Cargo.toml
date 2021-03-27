@@ -17,7 +17,7 @@ features = [
 
 # Supporting other hardware access, start-up
 [dependencies.teensy4-bsp]
-version = "0.2"
+version = "0.2.0"
 default-features = false  # Disable the BSP's USB driver
 features = ["rt"]
 
@@ -66,6 +66,9 @@ features = ["release_max_level_info"]
 [dependencies.cortex-m]
 version = "0.7"
 
+[dependencies.embedded-hal]
+version = "0.2.3"
+
 [[bin]]
 name = "audio"
 path = "src/audio.rs"
@@ -76,3 +79,6 @@ path = "src/support.rs"
 
 [patch.crates-io]
 usb-device = { path = "../../../usb-device" }
+imxrt-hal = { path = "../../../imxrt-hal/imxrt-hal" }
+imxrt-ral = { path = "../../../imxrt-ral" }
+#teensy4-bsp = { path = "../../../teensy4-rs" }

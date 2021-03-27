@@ -6,8 +6,10 @@ extern crate alloc;
 use modular_bitfield::prelude::*;
 use usb_device::class_prelude::*;
 
+mod control;
 mod descriptors;
 
+use crate::control::*;
 use crate::descriptors::*;
 
 #[derive(PartialEq, Debug)]
@@ -290,12 +292,14 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
             //log::info!("control: dir={:?} reqtype={:?} recip={:?} req={} value={} idx={} len={}", req.direction, req.request_type, req.recipient, req.request, req.value, req.index, req.length);
             //if req.recipient == usb_device::control::Recipient::Interface && req.value == 256 && req.request == 2 && req.index == 514 {
             if reqtype == ControlType::Range && entity_id == 2 {
-                xfer.accept_with(&[
-                    0x1, 0x0, // 1 subrange
-                    0x44, 0xac, 0x00, 0x00, // MIN
-                    0x44, 0xac, 0x00, 0x00, // MAX
-                    0x0, 0x0, 0x0, 0x0, // RES
-                ])
+                accept_get_with(
+                    xfer,
+                    &[ControlRange::<u32> {
+                        min: 44100,
+                        max: 44100,
+                        res: 0,
+                    }],
+                )
                 .expect("Couldn't accept transfer!");
             } else if reqtype == ControlType::Current && entity_id == 2 {
                 xfer.accept_with(&[
@@ -303,12 +307,14 @@ impl<'a, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio
                 ])
                 .expect("Couldn't accept transfer!");
             } else if reqtype == ControlType::Range && entity_id == 4 {
-                xfer.accept_with(&[
-                    0x1, 0x0, // 1 subrange
-                    0x44, 0xac, 0x00, 0x00, // MIN
-                    0x44, 0xac, 0x00, 0x00, // MAX
-                    0x0, 0x0, 0x0, 0x0, // RES
-                ])
+                accept_get_with(
+                    xfer,
+                    &[ControlRange::<u32> {
+                        min: 44100,
+                        max: 44100,
+                        res: 0,
+                    }],
+                )
                 .expect("Couldn't accept transfer!");
             } else if reqtype == ControlType::Current && entity_id == 4 {
                 xfer.accept_with(&[

@@ -17,6 +17,11 @@ extern crate alloc;
 
 use support::bsp::t41;
 use support::hal;
+use support::ral;
+use support::hal::adc;
+use embedded_hal::adc::OneShot;
+use support::bsp::interrupt;
+use cortex_m_rt::interrupt;
 
 use usb_device::prelude::*;
 use usb_device::class_prelude::*;
@@ -38,6 +43,82 @@ fn handle_alloc_error(allocation: core::alloc::Layout) -> ! {
     panic!("Allocation failed!");
 }
 
+struct AdcSource {
+    regs: ral::adc::Instance,
+}
+
+impl AdcSource {
+    fn new(regs: ral::adc::Instance) -> AdcSource {
+        AdcSource {
+            regs
+        }
+    }
+}
+
+impl hal::dma::Source<u16> for AdcSource {
+    type Error = ();
+
+    const SOURCE_REQUEST_SIGNAL: u32 = 24;
+
+    /// Returns a pointer to the register from which the DMA channel
+    /// reads data
+    ///
+    /// This is the register that software reads to acquire data from
+    /// a device. The type of the pointer describes the type of reads
+    /// the DMA channel performs when transferring data.
+    ///
+    /// This memory is assumed to be static.
+    fn source(&self) -> *const u16 {
+        //self.regs.R0
+        // TODO: Don't hardcode
+        0x400c_4024 as *const u16
+    }
+
+    /// Perform any actions necessary to enable DMA transfers
+    ///
+    /// Callers use this method to put the peripheral in a state where
+    /// it can supply the DMA channel with data.
+    fn enable_source(&mut self) -> Result<(), Self::Error> {
+        //let channel = <P as Pin<ADCx>>::Input::U32;
+        let channel = 1; // GPIO_AD_B0_12
+        ral::modify_reg!(ral::adc, self.regs, HC0, |_| channel);
+        Ok(())
+    }
+
+    /// Perform any actions necessary to disable or cancel DMA transfers
+    ///
+    /// This may include undoing the actions in `enable_source()`.
+    fn disable_source(&mut self) {
+        //
+    }
+
+}
+
+static ADC_BUFFER: hal::dma::Buffer<[u16; 256]> = hal::dma::Buffer::new([0; 256]);
+static ADC_BUFFER2: hal::dma::Buffer<[u16; 256]> = hal::dma::Buffer::new([0; 256]);
+
+static mut adc_count: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+static mut global_dma_periph: Option<hal::dma::Peripheral<AdcSource, u16, hal::dma::Linear<u16>, hal::dma::Linear<u16>>> = None;
+static mut off_adc_buffer: Option<hal::dma::Linear<u16>> = None;
+
+#[interrupt]
+fn DMA8_DMA24() {
+    unsafe {
+        if let Some(periph) = &mut global_dma_periph {
+            if periph.is_receive_interrupt() {
+                periph.receive_clear_interrupt();
+            }
+
+            let mut rx_buffer = periph.receive_complete().unwrap();
+            //adc_samps += 256;
+            periph.start_receive(off_adc_buffer.take().unwrap()).unwrap();
+            off_adc_buffer = Some(rx_buffer);
+            adc_count.fetch_add(256, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 #[cortex_m_rt::entry]
 fn main() -> ! {
     unsafe { ALLOCATOR.init(HEAP.as_ptr() as usize, 128*1024) }
@@ -49,6 +130,7 @@ fn main() -> ! {
         uart,
         mut dcdc,
         gpt1,
+        adc,
         ..
     } = hal::Peripherals::take().unwrap();
     let pins = t41::into_pins(iomuxc);
@@ -95,9 +177,54 @@ fn main() -> ! {
         ],
     }).unwrap();
 
+    // ADC initialization
+    let (adc1_builder, _) = adc.clock(&mut ccm.handle);
+
+    let mut adc1 = adc1_builder.build(adc::ClockSelect::default(), adc::ClockDivision::default());
+    let mut a1 = adc::AnalogInput::new(pins.p24);
+
+    let reading: u16 = adc1.read(&mut a1).unwrap();
+    log::info!("Initial ADC reading: {}", reading);
+
+    // Back to UART stuff
     let (ccm, _) = ccm.handle.raw();
     hal::ral::modify_reg!(hal::ral::ccm, ccm, CCGR6, CG1: 0b11, CG0: 0b11);
 
+    // Setup the ADC
+    // Clocking
+    // Use the IPG clock
+    log::info!("IPG clock is set to {:?}", ipg_hz);
+
+    let adc1 = adc1.into_regs();
+
+    hal::ral::write_reg!(hal::ral::adc, adc1, CFG,
+        OVWREN: 1,
+        AVGS: 0b00, ADTRG: 0, REFSEL: 0, ADHSC: 0, ADSTS: 0b11,
+        ADLPC: 0, ADIV: 0b11, ADLSMP: 1, MODE: 0b10, ADICLK: 0b00);
+    hal::ral::write_reg!(hal::ral::adc, adc1, GC, ADCO: 1, AVGE: 0, DMAEN: 1);
+
+    // Setup DMA for the ADC
+    let mut channel = dma_channels[8].take().unwrap();
+    channel.set_interrupt_on_completion(true);
+
+    //let mut adc_buffer = hal::dma::Circular::new(&ADC_BUFFER).unwrap();
+    let mut adc_buffer = hal::dma::Linear::new(&ADC_BUFFER).unwrap();
+    adc_buffer.set_transfer_len(256);
+
+    let mut off_adc_buffer2 = hal::dma::Linear::new(&ADC_BUFFER2).unwrap();
+    off_adc_buffer2.set_transfer_len(256);
+
+    let adc_source = AdcSource::new(adc1);
+    let mut dma_peripheral = hal::dma::receive_u16(adc_source, channel);
+    dma_peripheral.start_receive(adc_buffer).unwrap();
+
+    unsafe {
+        global_dma_periph = Some(dma_peripheral);
+        off_adc_buffer = Some(off_adc_buffer2);
+        cortex_m::peripheral::NVIC::unmask(interrupt::DMA8_DMA24);
+    }
+
+    // USB initialization
     let bus_adapter = support::new_bus_adapter();
     let bus = usb_device::bus::UsbBusAllocator::new(bus_adapter);
 
@@ -136,10 +263,21 @@ fn main() -> ! {
     let mut last_sent_bytes = 0;
     let mut loops = 0;
     let mut update_countdown = 0;
+    let mut adc_min = 0;
+    let mut adc_max = 0;
+    let mut last_adc = 0;
+    let mut mic_data = vec!();
     loop {
         loops += 1;
         time_elapse(&mut gpt1, || {
-            log::info!("Num bytes recv'd = {} sent = {} loops = {}", audio.nbytes, audio.nbytes_sent, loops);
+            let adc_samps = unsafe { adc_count.load(core::sync::atomic::Ordering::SeqCst) };
+            log::info!("Num bytes recv'd = {} sent = {} loops = {} ADC samps = {} min/max={}/{}", audio.nbytes, audio.nbytes_sent, loops, adc_samps, adc_min, adc_max);
+            unsafe {
+                adc_count.store(0, core::sync::atomic::Ordering::SeqCst);
+            }
+
+            adc_min = last_adc;
+            adc_max = last_adc;
             led.toggle()
         });
         imxrt_uart_log::dma::poll();
@@ -147,20 +285,9 @@ fn main() -> ! {
             //continue;
         }
 
-        if update_countdown == 0 {
-            let buf = [5u8; 100];
-            audio.source_ep.write(&buf);
-            //audio.source_ep.write(&audio.mic_data[0..64]);
-
-            // We loop ~526,656 times per second (ish)
-            // We want to hit 44,100 samples per second
-            // which is one sample per ~11.9423 iterations
-            // We send 100 samples at a time
-            // so we want to send a packet every 1194 iterations
-            // But my math is wrong so let's try this number by trial-and-error
-            update_countdown = 2000;
-        } else {
-            update_countdown -= 1;
+        if mic_data.len() == 100 {
+            audio.source_ep.write(&mic_data[..]);
+            mic_data = vec!();
         }
     }
 }
