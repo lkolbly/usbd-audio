@@ -43,79 +43,82 @@ fn handle_alloc_error(allocation: core::alloc::Layout) -> ! {
     panic!("Allocation failed!");
 }
 
-struct AdcSource {
-    regs: ral::adc::Instance,
-}
-
-impl AdcSource {
-    fn new(regs: ral::adc::Instance) -> AdcSource {
-        AdcSource {
-            regs
-        }
-    }
-}
-
-impl hal::dma::Source<u16> for AdcSource {
-    type Error = ();
-
-    const SOURCE_REQUEST_SIGNAL: u32 = 24;
-
-    /// Returns a pointer to the register from which the DMA channel
-    /// reads data
-    ///
-    /// This is the register that software reads to acquire data from
-    /// a device. The type of the pointer describes the type of reads
-    /// the DMA channel performs when transferring data.
-    ///
-    /// This memory is assumed to be static.
-    fn source(&self) -> *const u16 {
-        //self.regs.R0
-        // TODO: Don't hardcode
-        0x400c_4024 as *const u16
-    }
-
-    /// Perform any actions necessary to enable DMA transfers
-    ///
-    /// Callers use this method to put the peripheral in a state where
-    /// it can supply the DMA channel with data.
-    fn enable_source(&mut self) -> Result<(), Self::Error> {
-        //let channel = <P as Pin<ADCx>>::Input::U32;
-        let channel = 1; // GPIO_AD_B0_12
-        ral::modify_reg!(ral::adc, self.regs, HC0, |_| channel);
-        Ok(())
-    }
-
-    /// Perform any actions necessary to disable or cancel DMA transfers
-    ///
-    /// This may include undoing the actions in `enable_source()`.
-    fn disable_source(&mut self) {
-        //
-    }
-
-}
-
 static ADC_BUFFER: hal::dma::Buffer<[u16; 256]> = hal::dma::Buffer::new([0; 256]);
 static ADC_BUFFER2: hal::dma::Buffer<[u16; 256]> = hal::dma::Buffer::new([0; 256]);
-
-static mut adc_count: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-static mut global_dma_periph: Option<hal::dma::Peripheral<AdcSource, u16, hal::dma::Linear<u16>, hal::dma::Linear<u16>>> = None;
-static mut off_adc_buffer: Option<hal::dma::Linear<u16>> = None;
+static mut streaming_adc: Option<hal::adc::StreamingAdc<hal::iomuxc::adc::ADC1, t41::P24>> = None;
 
 #[interrupt]
 fn DMA8_DMA24() {
     unsafe {
-        if let Some(periph) = &mut global_dma_periph {
-            if periph.is_receive_interrupt() {
-                periph.receive_clear_interrupt();
-            }
-
-            let mut rx_buffer = periph.receive_complete().unwrap();
-            //adc_samps += 256;
-            periph.start_receive(off_adc_buffer.take().unwrap()).unwrap();
-            off_adc_buffer = Some(rx_buffer);
-            adc_count.fetch_add(256, core::sync::atomic::Ordering::SeqCst);
+        if let Some(adc) = &mut streaming_adc {
+            adc.handle_interrupt();
         }
+    }
+}
+
+/// The ADC samples at 93696Hz, we want to output at 44100Hz
+/// So we need to resample at 1/2.1246, which we'll approximate with
+/// 1000/2125 or 8/17 (dividing out 125), giving us a true rate of ~44092Hz
+///
+/// For interpolation, we insert 7 zeroes after every sample, then we
+/// filter everything above Fs/16. The resulting sample rate Fsi = 749,568Hz
+///
+/// For decimation, we filter out everything above 20kHz (Fsi/38), and take
+/// every 17th sample.
+///
+/// For each output sample, we skip ahead 2 1/8th samples. Thus, with
+/// 8 filters, we consume 17 samples (2*8+8/8) and output 8 samples.
+///
+/// In general terms, with an N-tap filter M[0..N], output O[i] is:
+/// O[i] = sum(V[i-N+x] * M[x] for x in 0..N)
+/// V[i] = I[i/17] if i%17 == 0
+///      = 0 otherwise
+///
+/// Therefore, with N=50:
+/// O[0] = V[-50] * M[0] + V[-33] * M[17] + V[-16] * M[34]
+/// O[1] = ?
+struct PolyphaseFilterBank {
+    sample_offset: usize,
+    nsamps: usize,
+    raw_samples: [f32; 50],
+}
+
+const FILTER: [f32; 50] = [-1.5571565755041362e-20,5.299655672641262e-06,3.729570824646748e-05,0.00012457763600283632,0.00030323871904505245,0.0006182758531686576,0.0011238702437696656,0.0018821463770603017,0.0029601834785402945,0.004425282087467552,0.006338740597132057,0.008748640145754124,0.011682338016292702,0.015139500358883382,0.019086542908262744,0.02345328251739534,0.028132434417186106,0.03298233459649817,0.03783294946319836,0.04249489045854946,0.046770818593343866,0.050468341909227984,0.0534133117654359,0.055462336662509264,0.05651336783135692,0.05651336783135692,0.05546233666250927,0.05341331176543591,0.050468341909227984,0.04677081859334388,0.04249489045854947,0.03783294946319837,0.032982334596498186,0.028132434417186106,0.023453282517395355,0.019086542908262744,0.015139500358883395,0.011682338016292707,0.008748640145754133,0.006338740597132062,0.00442528208746756,0.002960183478540299,0.0018821463770603017,0.0011238702437696673,0.0006182758531686576,0.0003032387190450536,0.0001245776360028364,3.7295708246467734e-05,5.299655672641164e-06,-1.5571565755041362e-20];
+
+impl PolyphaseFilterBank {
+    fn consume(&mut self, data: &[f32]) -> alloc::vec::Vec<f32> {
+        let mut result = vec![];
+        data.iter().for_each(|sample| {
+            self.raw_samples[(self.sample_offset + self.nsamps) % 50] = *sample;
+            self.nsamps = (self.nsamps + 1) % 50;
+            while self.nsamps >= 21 {
+                let mut i = [0.0; 21];
+                for idx in 0..21 {
+                    i[idx] = self.raw_samples[(self.sample_offset + idx) % 50];
+                }
+                self.nsamps -= 17;
+                self.sample_offset = (self.sample_offset + 17) % 50;
+                let chunk = self.compute(&i);
+                for elem in chunk.iter() {
+                    result.push(*elem);
+                }
+            }
+        });
+        result
+    }
+
+    fn compute(&self, I: &[f32; 21]) -> [f32; 8] {
+        let F = &FILTER;
+        let mut O = [0.0; 8];
+        O[0] = I[0] * F[7] + I[1] * F[15] + I[2] * F[23] + I[3] * F[31] + I[4] * F[39] + I[5] * F[47];
+        O[1] = I[2] * F[6] + I[3] * F[14] + I[4] * F[22] + I[5] * F[30] + I[6] * F[38] + I[7] * F[46];
+        O[2] = I[4] * F[5] + I[5] * F[13] + I[6] * F[21] + I[7] * F[29] + I[8] * F[37] + I[9] * F[45];
+        O[3] = I[6] * F[4] + I[7] * F[12] + I[8] * F[20] + I[9] * F[28] + I[10] * F[36] + I[11] * F[44];
+        O[4] = I[8] * F[3] + I[9] * F[11] + I[10] * F[19] + I[11] * F[27] + I[12] * F[35] + I[13] * F[43];
+        O[5] = I[10] * F[2] + I[11] * F[10] + I[12] * F[18] + I[13] * F[26] + I[14] * F[34] + I[15] * F[42];
+        O[6] = I[12] * F[1] + I[13] * F[9] + I[14] * F[17] + I[15] * F[25] + I[16] * F[33] + I[17] * F[41] + I[18] * F[49];
+        O[7] = I[14] * F[0] + I[15] * F[8] + I[16] * F[16] + I[17] * F[24] + I[18] * F[32] + I[19] * F[40] + I[20] * F[48];
+        O
     }
 }
 
@@ -197,36 +200,20 @@ fn main() -> ! {
     hal::ral::modify_reg!(hal::ral::ccm, ccm, CCGR6, CG1: 0b11, CG0: 0b11);
 
     // Setup the ADC
-    // Clocking
-    // Use the IPG clock
     log::info!("IPG clock is set to {:?}", ipg_hz);
 
-    let adc1 = adc1.into_regs();
-
-    hal::ral::write_reg!(hal::ral::adc, adc1, CFG,
+    hal::ral::write_reg!(hal::ral::adc, adc1.get_regs(), CFG,
         OVWREN: 1,
         AVGS: 0b00, ADTRG: 0, REFSEL: 0, ADHSC: 0, ADSTS: 0b11,
         ADLPC: 0, ADIV: 0b11, ADLSMP: 1, MODE: 0b10, ADICLK: 0b00);
-    hal::ral::write_reg!(hal::ral::adc, adc1, GC, ADCO: 1, AVGE: 0, DMAEN: 1);
 
-    // Setup DMA for the ADC
     let mut channel = dma_channels[8].take().unwrap();
     channel.set_interrupt_on_completion(true);
-
-    //let mut adc_buffer = hal::dma::Circular::new(&ADC_BUFFER).unwrap();
-    let mut adc_buffer = hal::dma::Linear::new(&ADC_BUFFER).unwrap();
-    adc_buffer.set_transfer_len(256);
-
-    let mut off_adc_buffer2 = hal::dma::Linear::new(&ADC_BUFFER2).unwrap();
-    off_adc_buffer2.set_transfer_len(256);
-
-    let adc_source = AdcSource::new(adc1);
-    let mut dma_peripheral = hal::dma::receive_u16(adc_source, channel);
-    dma_peripheral.start_receive(adc_buffer).unwrap();
+    unsafe {
+        streaming_adc = Some(hal::adc::StreamingAdc::new(adc1, a1, channel, &ADC_BUFFER, &ADC_BUFFER2));
+    }
 
     unsafe {
-        global_dma_periph = Some(dma_peripheral);
-        off_adc_buffer = Some(off_adc_buffer2);
         cortex_m::peripheral::NVIC::unmask(interrupt::DMA8_DMA24);
     }
 
@@ -265,6 +252,16 @@ fn main() -> ! {
         data[i] = x as u8;
     }*/
 
+    unsafe {
+        streaming_adc.as_mut().unwrap().start();
+    }
+
+    let mut pfb = PolyphaseFilterBank{
+        sample_offset: 0,
+        nsamps: 0,
+        raw_samples: [0.0; 50],
+    };
+
     let mut n_sent = 1;
 
     let mut last_sent_bytes = 0;
@@ -272,19 +269,72 @@ fn main() -> ! {
     let mut update_countdown = 0;
     let mut adc_min = 0;
     let mut adc_max = 0;
+    let mut filtered_adc_min: f32 = 0.0;
+    let mut filtered_adc_max: f32 = 0.0;
     let mut last_adc = 0;
+    let mut nsamps = 0;
+    let mut filtered_samps = 0;
+    let mut last_processing_time = 0;
     let mut mic_data = vec!();
+    let mut blocks = 0;
+    let mut samps_dropped = 0;
     loop {
         loops += 1;
-        time_elapse(&mut gpt1, || {
-            let adc_samps = unsafe { adc_count.load(core::sync::atomic::Ordering::SeqCst) };
-            log::info!("{} RX'd = {} TX'd = {} loops = {} ADC samps = {} min/max={}/{}", gpt2.count(), audio.nbytes, audio.nbytes_sent, loops, adc_samps, adc_min, adc_max);
-            unsafe {
-                adc_count.store(0, core::sync::atomic::Ordering::SeqCst);
-            }
 
-            adc_min = last_adc;
-            adc_max = last_adc;
+        {
+            let mut sadc = unsafe { streaming_adc.as_mut().unwrap() };
+            sadc.poll(|buf| {
+                let start = gpt2.count();
+                adc_min = *buf.iter().chain(core::iter::once(&adc_min)).min().unwrap();
+                adc_max = *buf.iter().chain(core::iter::once(&adc_max)).max().unwrap();
+                nsamps += buf.len();
+                let mut readings = vec![];
+                for i in 0..buf.len() {
+                    let reading: u8 = (buf[i] >> 4) as u8;
+                    let reading: i8 = reading.wrapping_sub(128) as i8;
+                    readings.push(reading as f32);
+                }
+
+                for samp in pfb.consume(&readings[..]).iter() {
+                    if *samp < filtered_adc_min {
+                        filtered_adc_min = *samp;
+                    }
+                    if *samp > filtered_adc_max {
+                        filtered_adc_max = *samp;
+                    }
+                    if mic_data.len() < 1024 {
+                        let x = *samp * 10.0;
+                        mic_data.push(x as i8 as u8);
+                    } else {
+                        samps_dropped += 1;
+                    }
+                    filtered_samps += 1;
+                }
+
+                let end = gpt2.count();
+                if end < start {
+                    last_processing_time = 0xffff_ffff - (start - end);
+                } else {
+                    last_processing_time = end - start;
+                }
+            });
+        }
+
+        time_elapse(&mut gpt1, || {
+            // Note: GPT2 increments at 25M ticks per second (40ns/tick)
+            log::info!(
+                "{} RX'd = {} TX'd = {} blocks = {} dropped = {} loops = {} proctime = {} nsamps = {} filtered_samps = {} min/max={}/{} filtered range={}/{}",
+                gpt2.count(), audio.nbytes, audio.nbytes_sent, blocks, samps_dropped, loops, last_processing_time, nsamps, filtered_samps, adc_min, adc_max, filtered_adc_min, filtered_adc_max
+            );
+            nsamps = 0;
+            filtered_samps = 0;
+            filtered_adc_min = 0.0;
+            filtered_adc_max = 0.0;
+            blocks = 0;
+            samps_dropped = 0;
+
+            adc_min = 2048;
+            adc_max = 2048;
             led.toggle()
         });
         imxrt_uart_log::dma::poll();
@@ -292,9 +342,20 @@ fn main() -> ! {
             //continue;
         }
 
-        if mic_data.len() == 100 {
-            audio.source_ep.write(&mic_data[..]);
-            mic_data = vec!();
+        if mic_data.len() > 64 {
+            let end = if mic_data.len() > 64 { 64 } else { mic_data.len() };
+            match audio.source_ep.write(&mic_data[..end]) {
+                Ok(_) => {
+                    mic_data = mic_data[end..].to_vec();
+                },
+                Err(usb_device::UsbError::WouldBlock) => {
+                    // Would block, do nothing
+                    blocks += 1;
+                },
+                Err(e) => {
+                    panic!("Endpoint send error {:?}", e);
+                }
+            }
         }
     }
 }

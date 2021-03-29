@@ -492,8 +492,8 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
         //if addr.index() == 1 {
         //self.cnt += 1;
         //self.data_ep.write(&[5; 64]);
-        self.nbytes_sent += 100; //self.mic_data.len();
-                                 //self.source_ep.write(&self.mic_data);
-                                 //}
+        self.nbytes_sent += 64; //self.mic_data.len();
+                                //self.source_ep.write(&self.mic_data);
+                                //}
     }
 }
