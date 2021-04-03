@@ -141,6 +141,8 @@ pub struct UsbAudio<'a, 'b, B: usb_device::bus::UsbBus> {
     pub data_ep: usb_device::endpoint::EndpointOut<'a, B>,
     pub source_ep: usb_device::endpoint::EndpointIn<'a, B>,
     pub clocks: &'b [ClockSource],
+    pub samps: alloc::vec::Vec<u16>,
+    pub usb_overruns: usize,
 }
 
 impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
@@ -174,6 +176,8 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
                 1,
             ),
             clocks: clocks,
+            samps: vec![],
+            usb_overruns: 0,
             //mic_data: data,
         }
     }
@@ -485,6 +489,17 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
             //log::info!("RX'd data: EP{}", addr.index());
             //log::info!("{}", buf[5]);
             self.nbytes += nbytes;
+
+            if self.samps.len() < 512 {
+                //self.samps.append(&buf[..]);
+                for i in 0..nbytes / 2 {
+                    let hi = buf[i * 2 + 1];
+                    let lo = buf[i * 2];
+                    self.samps.push(((hi as u16) << 8) | lo as u16);
+                }
+            } else {
+                self.usb_overruns += nbytes;
+            }
         }
     }
 

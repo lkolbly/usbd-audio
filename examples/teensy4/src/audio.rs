@@ -135,6 +135,7 @@ fn main() -> ! {
         gpt1,
         gpt2,
         adc,
+        sai,
         ..
     } = hal::Peripherals::take().unwrap();
     let pins = t41::into_pins(iomuxc);
@@ -185,6 +186,125 @@ fn main() -> ! {
         filters: &[
         ],
     }).unwrap();
+
+    // Setup the SAI mclk
+    unsafe {
+        let ccm_analog = hal::ral::ccm_analog::CCM_ANALOG::steal();
+
+        // Copied from https://github.com/PaulStoffregen/Audio/blob/master/output_i2s.cpp
+        let fs = 44_100; //AUDIO_SAMPLE_RATE_EXACT
+        // PLL between 27*24 = 648MHz und 54*24=1296MHz
+        let n1 = 4; //SAI prescaler 4 => (n1*n2) = multiple of 4
+        let n2 = 1 + (24000000 * 27) / (fs * 256 * n1);
+    
+        let C = (fs as f64 * 256. * n1 as f64 * n2 as f64) / 24000000.;
+        let c0 = C as u32;
+        let c2 = 10000;
+        let c1 = (C * c2 as f64 - (c0 * c2) as f64) as u32;
+        //set_audioClock(c0, c1, c2);
+
+        log::info!("fs={} n1={} n2={} C={} c0={} c1={} c2={}", fs, n1, n2, C, c0, c1, c2);
+        //panic!("asdf");
+
+        // Bypass the PLL
+        hal::ral::write_reg!(hal::ral::ccm_analog, ccm_analog, PLL_AUDIO,
+            POST_DIV_SELECT: 0b10, // 1/4
+            DIV_SELECT: c0,
+            ENABLE: 1,
+            BYPASS: 1
+        );
+        /*hal::ral::modify_reg!(hal::ral::ccm_analog, ccm_analog, PLL_AUDIO,
+            POST_DIV_SELECT: 0b10,
+            DIV_SELECT: 27,
+            ENABLE: 1
+        );*/
+        hal::ral::modify_reg!(hal::ral::ccm_analog, ccm_analog, PLL_AUDIO_NUM,
+            A: c1
+        );
+        hal::ral::modify_reg!(hal::ral::ccm_analog, ccm_analog, PLL_AUDIO_DENOM,
+            B: c2
+        );
+        hal::ral::modify_reg!(hal::ral::ccm_analog, ccm_analog, PLL_AUDIO, POWERDOWN: 0);
+
+        // Wait for lock
+        while hal::ral::read_reg!(hal::ral::ccm_analog, ccm_analog, PLL_AUDIO, LOCK) == 0 {}
+
+        // Disable bypass
+        hal::ral::modify_reg!(hal::ral::ccm_analog, ccm_analog, PLL_AUDIO, BYPASS: 0);
+
+        let ccm = hal::ral::ccm::CCM::steal();
+
+        // Set the SAI clock to the audio PLL
+        hal::ral::modify_reg!(hal::ral::ccm, ccm, CSCMR1,
+            SAI1_CLK_SEL: 0b10 // PLL4
+        );
+        hal::ral::write_reg!(hal::ral::ccm, ccm, CS1CDR,
+            SAI1_CLK_PRED: n1 - 1,
+            SAI1_CLK_PODF: n2 - 1
+        );
+
+        let iomuxc_gpr = hal::ral::iomuxc_gpr::IOMUXC_GPR::steal();
+        hal::ral::modify_reg!(hal::ral::iomuxc_gpr, iomuxc_gpr, GPR1,
+            SAI1_MCLK_DIR: 1,  // Is output
+            SAI1_MCLK1_SEL: 3 // ssi1_clk_root
+        );
+
+        /*let ccm = hal::ral::ccm::CCM::steal();
+        hal::ral::modify_reg!(hal::ral::ccm, ccm, CS1CDR,
+            SAI1_CLK_PRED: 6, // divide by N-1
+            SAI1_CLK_PODF: 1 // Divide by N-1
+        );
+        hal::ral::modify_reg!(hal::ral::ccm, ccm, CSCMR1,
+            SAI1_CLK_SEL: 0
+        );
+
+        let iomuxc_gpr = hal::ral::iomuxc_gpr::IOMUXC_GPR::steal();
+        hal::ral::modify_reg!(hal::ral::iomuxc_gpr, iomuxc_gpr, GPR1,
+            SAI1_MCLK_DIR: 1  // Is output
+            //SAI1_MCLK1_SEL: 3 // ssi1_clk_root
+        );*/
+    }
+
+    // Setup the SAI interface
+    let (sai1_builder, _, _) = sai.clock(&mut ccm.handle);
+
+    // 44.1kHz * 32 * 2 = 2,822,400Hz
+    // Bus clock = 20MHz
+    // -> divider = 7.086
+    // = (DIV + 1) * 2 => DIV = 3
+    let mut sai1 = sai1_builder.build_1bit_tx(hal::sai::ClockConfig {
+        bclk_active_high: true,
+        bclk_div: 26,
+        bclk_external: false,
+        mclk: hal::sai::Mclk::BusClock,
+    }, pins.p23, pins.p26, pins.p27, pins.p39);
+    ral::write_reg!(ral::sai, sai1.regs(), TCR2,
+        DIV: 1,
+        BCD: 1, // Internal bit clock
+        BCP: 1, // Sample on rising edge
+        MSEL: 1, // MCLK1
+        BCI: 0, BCS: 0, SYNC: 0);
+    ral::write_reg!(ral::sai, sai1.regs(), TCR3,
+        TCE: 0b1);
+    ral::write_reg!(ral::sai, sai1.regs(), TCR4,
+        FSD: 1, // We generate frame sync
+        FSP: 1, // Active high
+        ONDEM: 0, // Frame sync is generated continuously
+        FSE: 1, // Frame sync occurs one bit before first bit
+        MF: 1, // MSB first
+        CHMOD: 0,
+        SYWD: 31, // Length of frame sync
+        FRSZ: 1, // 2 words per frame
+        FPACK: 0, // No FIFO packing
+        FCOMB: 0, // No FIFO combining
+        FCONT: 0 // FIFO continue on error
+    );
+    ral::write_reg!(ral::sai, sai1.regs(), TCR5,
+        FBT: 31, // Not shifted
+        W0W: 31, WNW: 31);
+    hal::ral::write_reg!(hal::ral::sai, sai1.regs(), TCSR,
+        TE: 1
+    );
 
     // ADC initialization
     let (adc1_builder, _) = adc.clock(&mut ccm.handle);
@@ -264,6 +384,9 @@ fn main() -> ! {
 
     let mut n_sent = 1;
 
+    log::info!("SAI version: {:?}", sai1.version());
+    log::info!("0x{:x}", hal::ral::read_reg!(hal::ral::sai, sai1.regs(), TCSR));
+
     let mut last_sent_bytes = 0;
     let mut loops = 0;
     let mut update_countdown = 0;
@@ -278,6 +401,12 @@ fn main() -> ! {
     let mut mic_data = vec!();
     let mut blocks = 0;
     let mut samps_dropped = 0;
+    let mut i2s_samps_sent = 0;
+    let mut i2s_underruns = 0;
+    let mut i2s_usb_overruns = 0;
+    let mut i2s_offset = 0;
+    let mut output_buffer: alloc::vec::Vec<u16> = vec![];
+    let mut max_out_sample = 0;
     loop {
         loops += 1;
 
@@ -323,15 +452,21 @@ fn main() -> ! {
         time_elapse(&mut gpt1, || {
             // Note: GPT2 increments at 25M ticks per second (40ns/tick)
             log::info!(
-                "{} RX'd = {} TX'd = {} blocks = {} dropped = {} loops = {} proctime = {} nsamps = {} filtered_samps = {} min/max={}/{} filtered range={}/{}",
-                gpt2.count(), audio.nbytes, audio.nbytes_sent, blocks, samps_dropped, loops, last_processing_time, nsamps, filtered_samps, adc_min, adc_max, filtered_adc_min, filtered_adc_max
+                "{} RX'd = {} TX'd = {} blocks = {} dropped = {} loops = {} proctime = {} nsamps = {} filtered_samps = {} min/max={}/{} filtered range={}/{} I2S samps sent = {} underruns = {} overruns = {} max = {}",
+                gpt2.count(), audio.nbytes, audio.nbytes_sent, blocks, samps_dropped, loops, last_processing_time, nsamps, filtered_samps, adc_min, adc_max, filtered_adc_min, filtered_adc_max, i2s_samps_sent, i2s_underruns, audio.usb_overruns, max_out_sample,
             );
+            log::info!("0x{:x}", hal::ral::read_reg!(hal::ral::sai, sai1.regs(), TCSR));
             nsamps = 0;
             filtered_samps = 0;
             filtered_adc_min = 0.0;
             filtered_adc_max = 0.0;
             blocks = 0;
             samps_dropped = 0;
+            i2s_samps_sent = 0;
+            i2s_underruns = 0;
+            i2s_usb_overruns = 0;
+            audio.usb_overruns = 0;
+            max_out_sample = 0;
 
             adc_min = 2048;
             adc_max = 2048;
@@ -356,6 +491,53 @@ fn main() -> ! {
                     panic!("Endpoint send error {:?}", e);
                 }
             }
+        }
+
+        if audio.samps.len() > 0 {
+            if output_buffer.len() < 512 {
+                for elem in audio.samps.iter() {
+                    // Twice: Once for each channel
+                    output_buffer.push(*elem);
+                    //output_buffer.push(*elem);
+                }
+                audio.samps = vec![];
+            } else {
+                //i2s_usb_overruns += 1;
+            }
+        }
+
+        // Add data to the I2S FIFO
+        let mut n_added = 0;
+        loop {
+            let tfr0 = hal::ral::read_reg!(hal::ral::sai, sai1.regs(), TFR0);
+            let wfp = (tfr0 >> 16) & 0b11_1111;
+            let rfp = tfr0 & 0b11_1111;
+            let is_full = ((wfp & 0b1_1111) == (rfp & 0b1_1111) && (wfp & 0b10_0000) != (rfp & 0b10_0000));
+            let is_empty = wfp == rfp;
+            if (hal::ral::read_reg!(hal::ral::sai, sai1.regs(), TCSR, FEF) != 0) {
+                hal::ral::modify_reg!(hal::ral::sai, sai1.regs(), TCSR, FEF: 1);
+            }
+            if (!is_full) {
+                if output_buffer.len() > n_added {
+                    if output_buffer[n_added] > max_out_sample {
+                        max_out_sample = output_buffer[n_added];
+                    }
+                    let samp = output_buffer[n_added] as i16 as f32 as i32 as u32;
+                    hal::ral::write_reg!(hal::ral::sai, sai1.regs(), TDR0, TDR: samp << 16);
+                    n_added += 1;
+                    i2s_samps_sent += 1;
+                } else {
+                    hal::ral::write_reg!(hal::ral::sai, sai1.regs(), TDR0, TDR: 0);
+                    i2s_underruns += 1;
+                }
+                i2s_offset += 1;
+            }
+            if (is_full) {
+                break;
+            }
+        }
+        if output_buffer.len() >= n_added {
+            output_buffer.drain(..n_added);
         }
     }
 }
