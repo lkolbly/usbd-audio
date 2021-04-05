@@ -477,8 +477,8 @@ fn main() -> ! {
             //continue;
         }
 
-        if mic_data.len() > 64 {
-            let end = if mic_data.len() > 64 { 64 } else { mic_data.len() };
+        if mic_data.len() > 45 {
+            let end = if mic_data.len() > 45 { 45 } else { mic_data.len() };
             match audio.source_ep.write(&mic_data[..end]) {
                 Ok(_) => {
                     mic_data = mic_data[end..].to_vec();

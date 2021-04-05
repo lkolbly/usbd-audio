@@ -99,6 +99,7 @@ impl ClockSource {
                     .with_sync_to_sof(false)
                     .with_associated_terminal_id(0)
                     .with_name(0)
+                    .with_frequency(Control::ReadWrite)
                     .into_bytes(),
             )
             .unwrap();
@@ -136,7 +137,9 @@ pub struct UsbAudio<'a, 'b, B: usb_device::bus::UsbBus> {
     pub nbytes: usize,
     pub nbytes_sent: usize,
     pub iface: usb_device::class_prelude::InterfaceNumber,
+    pub alt_setting_2: u8,
     pub iface2: InterfaceNumber,
+    pub alt_setting_3: u8,
     pub iface3: InterfaceNumber,
     pub data_ep: usb_device::endpoint::EndpointOut<'a, B>,
     pub source_ep: usb_device::endpoint::EndpointIn<'a, B>,
@@ -161,18 +164,22 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
             nbytes: 0,
             nbytes_sent: 0,
             iface: alloc.interface(),
+            alt_setting_2: 0,
             iface2: alloc.interface(),
+            alt_setting_3: 0,
             iface3: alloc.interface(),
+            // TODO: usb_device should let us explicitly allocate a data EP & feedback
+            // EP with appropriate EP numbers
             data_ep: alloc.isochronous(
-                IsochronousSynchronizationType::NoSynchronization,
+                IsochronousSynchronizationType::Adaptive,
                 IsochronousUsageType::Data,
                 200,
                 1,
             ),
             source_ep: alloc.isochronous(
-                IsochronousSynchronizationType::NoSynchronization,
+                IsochronousSynchronizationType::Asynchronous,
                 IsochronousUsageType::Data,
-                64,
+                45,
                 1,
             ),
             clocks: clocks,
@@ -209,7 +216,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
             &AudioClass::new()
                 .with_subtype(Subtype::Header)
                 .with_spec_number_major(0)
-                .with_spec_number_minor(0)
+                .with_spec_number_minor(2)
                 .with_category(0xff)
                 .with_total_length(8 + 17 * 2 + 12 * 2)
                 .with_latency_control(0)
@@ -260,7 +267,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 .with_terminal_id(4)
                 .with_terminal_type(0x0101)
                 .with_associated_terminal_id(0)
-                .with_source_id(6)
+                .with_source_id(5)
                 .with_clock_source_id(2)
                 .with_name(0)
                 .into_bytes(),
@@ -284,7 +291,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
         )?;
 
         // Feature unit in Microphone path
-        writer.write(
+        /*writer.write(
             CS_INTERFACE,
             &[
                 6, // FEATURE_UNIT
@@ -293,15 +300,18 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 0x0, 0x0, 0x0, 0x0, // bmaControls
                 0,   // iFeature
             ],
-        )?;
+        )?;*/
 
         // Setup the speaker streaming
         //writer.iad(self.iface2, 1, 1 /* AUDIO */, 2 /* STREAMING */, 0)?;
-        writer.interface(
+        writer.interface_alt(self.iface2, 0, 1, 2, 0x20, None)?;
+        writer.interface_alt(
             self.iface2,
+            1, /* alt */
             1, /* AUDIO */
             2, /* STREAMING */
             0x20,
+            None,
         )?;
         writer.write(
             CS_INTERFACE,
@@ -336,11 +346,14 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
         )?;
 
         // Setup the microphone streaming
-        writer.interface(
+        writer.interface_alt(self.iface3, 0, 1, 2, 0x20, None)?;
+        writer.interface_alt(
             self.iface3,
+            1, /* alt */
             1, /* AUDIO */
             2, /* STREAMING */
             0x20,
+            None,
         )?;
         writer.write(
             CS_INTERFACE,
@@ -375,6 +388,32 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
         )?;
 
         Ok(())
+    }
+
+    fn get_alt_setting(&mut self, interface: InterfaceNumber) -> Option<u8> {
+        let i: u8 = interface.into();
+        log::info!("get_alt_setting(iface=0x{:x})", i);
+        if interface == self.iface2 {
+            Some(self.alt_setting_2)
+        } else if interface == self.iface3 {
+            Some(self.alt_setting_3)
+        } else {
+            None
+        }
+    }
+
+    fn set_alt_setting(&mut self, interface: InterfaceNumber, alt: u8) -> bool {
+        let i: u8 = interface.into();
+        log::info!("set_alt_setting(iface=0x{:x}, alt={})", i, alt);
+        if interface == self.iface2 {
+            self.alt_setting_2 = alt;
+            true
+        } else if interface == self.iface3 {
+            self.alt_setting_3 = alt;
+            true
+        } else {
+            false
+        }
     }
 
     fn control_in(&mut self, xfer: ControlIn<'_, '_, '_, B>) {
@@ -468,11 +507,21 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
             //log::info!("Handling");
             //xfer.reject().expect("Couldn't reject");
             xfer.accept().expect("Couldn't accept");
-        } /* else if req.recipient == usb_device::control::Recipient::Endpoint && req.request == 1 && req.index == 1 {
-              xfer.accept().expect("Couldn't reject");
-          } else if req.recipient == usb_device::control::Recipient::Endpoint && req.request == 1 && req.index == 129 {
-              xfer.accept().expect("Couldn't reject");
-          }*/
+        } else if req.recipient == usb_device::control::Recipient::Interface
+            && req.request_type == usb_device::control::RequestType::Class
+            && req.request == 1
+            && req.value == 256
+            && req.index == 512
+        {
+            // Setting the Clock Valid control?
+            //log::info!("{:?}", req.);
+            xfer.accept().expect("Couldn't accept");
+        }
+        /* else if req.recipient == usb_device::control::Recipient::Endpoint && req.request == 1 && req.index == 1 {
+            xfer.accept().expect("Couldn't reject");
+        } else if req.recipient == usb_device::control::Recipient::Endpoint && req.request == 1 && req.index == 129 {
+            xfer.accept().expect("Couldn't reject");
+        }*/
         //}
     }
 
@@ -507,7 +556,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
         //if addr.index() == 1 {
         //self.cnt += 1;
         //self.data_ep.write(&[5; 64]);
-        self.nbytes_sent += 64; //self.mic_data.len();
+        self.nbytes_sent += 45; //self.mic_data.len();
                                 //self.source_ep.write(&self.mic_data);
                                 //}
     }
