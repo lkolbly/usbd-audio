@@ -79,7 +79,7 @@ trait ControlEntity {
 }
 
 pub struct ClockSource {
-    entity_id: u8,
+    pub entity_id: u8,
 }
 
 impl ClockSource {
@@ -133,6 +133,51 @@ impl ControlEntity for ClockSource {
     }
 }
 
+pub struct SampleBuffer {
+    channels: usize,
+    buffer: alloc::vec::Vec<u16>,
+    pub pushed: usize,
+    pub popped: usize,
+}
+
+impl SampleBuffer {
+    pub fn new(channels: usize) -> Self {
+        SampleBuffer {
+            channels,
+            buffer: vec![],
+            pushed: 0,
+            popped: 0,
+        }
+    }
+
+    pub fn push(&mut self, sample: &[u16]) {
+        assert!(sample.len() == self.channels);
+        if self.buffer.len() >= 512 {
+            // Overflow
+            // TODO: Report it
+            return;
+        }
+        for i in 0..self.channels {
+            self.buffer.push(sample[i]);
+            self.pushed += 1;
+        }
+    }
+
+    pub fn next<F: FnOnce(&[u16])>(&mut self, cb: F) -> bool {
+        if self.buffer.len() == 0 {
+            return false;
+        }
+        // Samples should only be added or removed in multiples of channel
+        assert!(self.buffer.len() >= self.channels);
+        cb(&self.buffer[0..self.channels]);
+        for _ in 0..self.channels {
+            self.buffer.remove(0);
+            self.popped += 1;
+        }
+        true
+    }
+}
+
 pub struct UsbAudio<'a, 'b, B: usb_device::bus::UsbBus> {
     pub nbytes: usize,
     pub nbytes_sent: usize,
@@ -142,10 +187,13 @@ pub struct UsbAudio<'a, 'b, B: usb_device::bus::UsbBus> {
     pub alt_setting_3: u8,
     pub iface3: InterfaceNumber,
     pub data_ep: usb_device::endpoint::EndpointOut<'a, B>,
+    pub data_feedback_ep: usb_device::endpoint::EndpointIn<'a, B>,
     pub source_ep: usb_device::endpoint::EndpointIn<'a, B>,
     pub clocks: &'b [ClockSource],
-    pub samps: alloc::vec::Vec<u16>,
+    //pub samps: alloc::vec::Vec<u16>,
+    pub samps: SampleBuffer,
     pub usb_overruns: usize,
+    pub feedback_flag: bool,
 }
 
 impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
@@ -171,9 +219,15 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
             // TODO: usb_device should let us explicitly allocate a data EP & feedback
             // EP with appropriate EP numbers
             data_ep: alloc.isochronous(
-                IsochronousSynchronizationType::Adaptive,
+                IsochronousSynchronizationType::Asynchronous,
                 IsochronousUsageType::Data,
                 200,
+                1,
+            ),
+            data_feedback_ep: alloc.isochronous(
+                IsochronousSynchronizationType::NoSynchronization,
+                IsochronousUsageType::Feedback,
+                3,
                 1,
             ),
             source_ep: alloc.isochronous(
@@ -183,9 +237,11 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
                 1,
             ),
             clocks: clocks,
-            samps: vec![],
+            //samps: vec![],
+            samps: SampleBuffer::new(2),
             usb_overruns: 0,
             //mic_data: data,
+            feedback_flag: false,
         }
     }
 }
@@ -344,6 +400,8 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 .with_subtype(EndpointDescriptorSubtype::General)
                 .into_bytes(),
         )?;
+
+        writer.endpoint(&self.data_feedback_ep)?;
 
         // Setup the microphone streaming
         writer.interface_alt(self.iface3, 0, 1, 2, 0x20, None)?;
@@ -539,7 +597,19 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
             //log::info!("{}", buf[5]);
             self.nbytes += nbytes;
 
-            if self.samps.len() < 512 {
+            for i in 0..nbytes / 4 {
+                let hi = buf[i * 4 + 1];
+                let lo = buf[i * 4];
+                let left = ((hi as u16) << 8) | lo as u16;
+
+                let hi = buf[i * 4 + 3];
+                let lo = buf[i * 4 + 2];
+                let right = ((hi as u16) << 8) | lo as u16;
+
+                self.samps.push(&[left, right]);
+            }
+
+            /*if self.samps.len() < 512 {
                 //self.samps.append(&buf[..]);
                 for i in 0..nbytes / 2 {
                     let hi = buf[i * 2 + 1];
@@ -548,7 +618,8 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 }
             } else {
                 self.usb_overruns += nbytes;
-            }
+            }*/
+            self.feedback_flag = true;
         }
     }
 
