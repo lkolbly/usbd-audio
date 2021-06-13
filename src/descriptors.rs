@@ -47,7 +47,7 @@ pub struct AudioClass {
 }
 
 #[bitfield]
-#[derive(BitfieldSpecifier)]
+#[derive(BitfieldSpecifier, Clone)]
 pub struct ChannelConfig {
     pub channels: B32,
 }

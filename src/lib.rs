@@ -78,15 +78,78 @@ trait ControlEntity {
     fn get_range<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W);
 }
 
-pub struct ClockSource {
-    pub entity_id: u8,
+/// Trait for entities which output audio
+pub trait AudioSourceEntity {
+    fn entity_id(&self) -> u8;
 }
 
-impl ClockSource {
-    pub fn new(entity_id: u8) -> ClockSource {
-        ClockSource { entity_id }
+pub struct EntityAllocator {
+    primary_iface: InterfaceNumber,
+    next_entity_id: core::cell::RefCell<u8>,
+}
+
+impl EntityAllocator {
+    pub fn new<B: usb_device::bus::UsbBus>(alloc: &usb_device::bus::UsbBusAllocator<B>) -> Self {
+        Self {
+            primary_iface: alloc.interface(),
+            next_entity_id: core::cell::RefCell::new(1),
+        }
     }
 
+    fn next_eid(&self) -> u8 {
+        let eid = *self.next_entity_id.borrow();
+        *self.next_entity_id.borrow_mut() += 1;
+        eid
+    }
+
+    pub fn make_clock(&self) -> ClockSource {
+        ClockSource {
+            entity_id: self.next_eid(),
+            _lifetime: core::marker::PhantomData,
+        }
+    }
+
+    pub fn make_usb_stream_source<'audio, 'usb, B: usb_device::bus::UsbBus>(
+        &'audio self,
+        alloc: &'usb usb_device::bus::UsbBusAllocator<B>,
+        clock: &ClockSource<'audio>,
+    ) -> UsbStreamSource<'audio, 'usb, B> {
+        let eid = self.next_eid();
+        UsbStreamSource {
+            entity_id: eid,
+            clock_id: clock.entity_id,
+            channels: ChannelConfig::new().with_channels(3),
+            endpoint: alloc.isochronous(
+                IsochronousSynchronizationType::Adaptive,
+                IsochronousUsageType::Data,
+                200,
+                1,
+            ),
+            iface: alloc.interface(),
+            _allocator: core::marker::PhantomData,
+        }
+    }
+
+    pub fn make_external_audio_sink<'audio>(
+        &'audio self,
+        clock: &ClockSource<'audio>,
+        source: &AudioSourceEntity,
+    ) -> ExternalAudioSink<'audio> {
+        ExternalAudioSink {
+            entity_id: self.next_eid(),
+            clock_id: clock.entity_id,
+            source_id: source.entity_id(),
+            _allocator: core::marker::PhantomData,
+        }
+    }
+}
+
+pub struct ClockSource<'a> {
+    pub entity_id: u8,
+    _lifetime: core::marker::PhantomData<&'a u8>,
+}
+
+impl<'a> ClockSource<'a> {
     fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
         let CS_INTERFACE = 0x24;
         writer
@@ -106,7 +169,7 @@ impl ClockSource {
     }
 }
 
-impl ControlEntity for ClockSource {
+impl<'a> ControlEntity for ClockSource<'a> {
     fn entity_id(&self) -> u8 {
         self.entity_id
     }
@@ -130,6 +193,119 @@ impl ControlEntity for ClockSource {
         } else {
             // TODO: Handle unrecognized controls
         }
+    }
+}
+
+pub struct UsbStreamSource<'audio, 'usb, B: usb_device::bus::UsbBus> {
+    entity_id: u8,
+    clock_id: u8,
+    channels: ChannelConfig,
+    endpoint: usb_device::endpoint::EndpointOut<'usb, B>,
+    iface: InterfaceNumber,
+    _allocator: core::marker::PhantomData<&'audio EntityAllocator>,
+}
+
+impl<'audio, 'usb, B: usb_device::bus::UsbBus> AudioSourceEntity
+    for UsbStreamSource<'audio, 'usb, B>
+{
+    fn entity_id(&self) -> u8 {
+        self.entity_id
+    }
+}
+
+impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSource<'audio, 'usb, B> {
+    fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
+        let CS_INTERFACE = 0x24;
+        writer
+            .write(
+                CS_INTERFACE,
+                &InputTerminal::new()
+                    .with_subtype(Subtype::InputTerminal)
+                    .with_terminal_id(self.entity_id)
+                    .with_terminal_type(0x0101)
+                    .with_associated_terminal_id(0)
+                    .with_clock_source_id(self.clock_id)
+                    .with_num_channels(2) //self.channels.count())
+                    .with_channel_config(self.channels.clone())
+                    .with_channel_names(0)
+                    .with_controls(InputTerminalControls::new())
+                    .with_terminal(0)
+                    .into_bytes(),
+            )
+            .unwrap(); // TODO: Return error
+    }
+
+    fn write_stream_iface(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+    ) -> usb_device::Result<()> {
+        let CS_INTERFACE = 0x24;
+        writer.interface_alt(self.iface, 0, 1, 2, 0x20, None)?;
+        writer.interface_alt(
+            self.iface, 1, /* alt */
+            1, /* AUDIO */
+            2, /* STREAMING */
+            0x20, None,
+        )?;
+        writer.write(
+            CS_INTERFACE,
+            &AudioStreamingInterface::new()
+                .with_subtype(StreamingSubtype::General)
+                .with_terminal_id(self.entity_id)
+                .with_format_type(FormatType::Type1)
+                .with_formats(Formats::new().with_pcm(true))
+                .with_num_channels(2) //self.channels.count())
+                .with_channel_config(self.channels.clone())
+                .with_channel_names(0)
+                .into_bytes(),
+        )?;
+        writer.write(
+            CS_INTERFACE,
+            &Type1Format::new()
+                .with_subtype(StreamingSubtype::FormatType)
+                .with_format_type(FormatType::Type1)
+                .with_subslot_size(2)
+                .with_bit_resolution(16)
+                .into_bytes(),
+        )?;
+
+        writer.endpoint(&self.endpoint)?;
+
+        // Class specific endpoint descriptor
+        writer.write(
+            0x25, // CS_ENDPOINT
+            &AudioStreamingEndpoint::new()
+                .with_subtype(EndpointDescriptorSubtype::General)
+                .into_bytes(),
+        )?;
+        Ok(())
+    }
+}
+
+pub struct ExternalAudioSink<'audio> {
+    entity_id: u8,
+    clock_id: u8,
+    source_id: u8,
+    _allocator: core::marker::PhantomData<&'audio EntityAllocator>,
+}
+
+impl<'audio> ExternalAudioSink<'audio> {
+    fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
+        let CS_INTERFACE = 0x24;
+        writer
+            .write(
+                CS_INTERFACE,
+                &OutputTerminal::new()
+                    .with_subtype(Subtype::OutputTerminal)
+                    .with_terminal_id(self.entity_id)
+                    .with_terminal_type(0x0301)
+                    .with_associated_terminal_id(0)
+                    .with_source_id(self.source_id)
+                    .with_clock_source_id(self.clock_id)
+                    .with_name(0)
+                    .into_bytes(),
+            )
+            .unwrap(); // TODO: Return error
     }
 }
 
@@ -178,30 +354,35 @@ impl SampleBuffer {
     }
 }
 
-pub struct UsbAudio<'a, 'b, B: usb_device::bus::UsbBus> {
+pub struct UsbAudio<'a, 'b, 'audio, B: usb_device::bus::UsbBus> {
     pub nbytes: usize,
     pub nbytes_sent: usize,
     pub iface: usb_device::class_prelude::InterfaceNumber,
     pub alt_setting_2: u8,
-    pub iface2: InterfaceNumber,
+    //pub iface2: InterfaceNumber,
     pub alt_setting_3: u8,
     pub iface3: InterfaceNumber,
-    pub data_ep: usb_device::endpoint::EndpointOut<'a, B>,
-    pub data_feedback_ep: usb_device::endpoint::EndpointIn<'a, B>,
+    //pub data_ep: usb_device::endpoint::EndpointOut<'a, B>,
+    //pub data_feedback_ep: usb_device::endpoint::EndpointIn<'a, B>,
     pub source_ep: usb_device::endpoint::EndpointIn<'a, B>,
-    pub clocks: &'b [ClockSource],
+    pub clocks: &'b [ClockSource<'audio>],
+    pub stream_sources: &'b [UsbStreamSource<'audio, 'a, B>],
+    pub ext_audio_sinks: &'b [ExternalAudioSink<'audio>],
     //pub samps: alloc::vec::Vec<u16>,
     pub samps: SampleBuffer,
     pub usb_overruns: usize,
     pub feedback_flag: bool,
 }
 
-impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
+impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
     pub fn new(
+        audio_alloc: &'audio EntityAllocator,
         alloc: &'a usb_device::bus::UsbBusAllocator<B>,
         max_packet_size: u16,
-        clocks: &'b [ClockSource],
-    ) -> UsbAudio<'a, 'b, B> {
+        clocks: &'b [ClockSource<'audio>],
+        stream_sources: &'b [UsbStreamSource<'audio, 'a, B>],
+        ext_audio_sinks: &'b [ExternalAudioSink<'audio>],
+    ) -> Self {
         /*let mut data = [0; 100];
         for i in 0..100 {
             let x = (i as f32).sin() * 127.;
@@ -211,25 +392,25 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
         UsbAudio {
             nbytes: 0,
             nbytes_sent: 0,
-            iface: alloc.interface(),
+            iface: audio_alloc.primary_iface, //alloc.interface(),
             alt_setting_2: 0,
-            iface2: alloc.interface(),
+            //iface2: alloc.interface(),
             alt_setting_3: 0,
             iface3: alloc.interface(),
             // TODO: usb_device should let us explicitly allocate a data EP & feedback
             // EP with appropriate EP numbers
-            data_ep: alloc.isochronous(
-                IsochronousSynchronizationType::Asynchronous,
+            /*data_ep: alloc.isochronous(
+                IsochronousSynchronizationType::Adaptive,
                 IsochronousUsageType::Data,
                 200,
                 1,
-            ),
-            data_feedback_ep: alloc.isochronous(
+            ),*/
+            /*data_feedback_ep: alloc.isochronous(
                 IsochronousSynchronizationType::NoSynchronization,
                 IsochronousUsageType::Feedback,
-                3,
+                4, // 3 bytes doesn't work with Windows
                 1,
-            ),
+            ),*/
             source_ep: alloc.isochronous(
                 IsochronousSynchronizationType::Asynchronous,
                 IsochronousUsageType::Data,
@@ -237,6 +418,8 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
                 1,
             ),
             clocks: clocks,
+            stream_sources: stream_sources,
+            ext_audio_sinks: ext_audio_sinks,
             //samps: vec![],
             samps: SampleBuffer::new(2),
             usb_overruns: 0,
@@ -246,7 +429,9 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, B> {
     }
 }
 
-impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbAudio<'a, 'b, B> {
+impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
+    for UsbAudio<'a, 'b, 'audio, B>
+{
     fn get_configuration_descriptors(
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
@@ -281,7 +466,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
 
         // USB IN <--> Speakers route
         // USB IN
-        writer.write(
+        /*writer.write(
             CS_INTERFACE,
             &InputTerminal::new()
                 .with_subtype(Subtype::InputTerminal)
@@ -295,13 +480,19 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 .with_controls(InputTerminalControls::new())
                 .with_terminal(0)
                 .into_bytes(),
-        )?;
+        )?;*/
         for clock in self.clocks.iter() {
             clock.write_descriptor(writer);
         }
+        for usb_source in self.stream_sources.iter() {
+            usb_source.write_descriptor(writer);
+        }
+        for ext_audio_sink in self.ext_audio_sinks.iter() {
+            ext_audio_sink.write_descriptor(writer);
+        }
 
         // Speakers
-        writer.write(
+        /*writer.write(
             CS_INTERFACE,
             &OutputTerminal::new()
                 .with_subtype(Subtype::OutputTerminal)
@@ -312,7 +503,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 .with_clock_source_id(2)
                 .with_name(0)
                 .into_bytes(),
-        )?;
+        )?;*/
 
         // USB OUT <--> Feature Unit <--> Microphone route
         // USB OUT
@@ -324,7 +515,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 .with_terminal_type(0x0101)
                 .with_associated_terminal_id(0)
                 .with_source_id(5)
-                .with_clock_source_id(2)
+                .with_clock_source_id(self.clocks[0].entity_id)
                 .with_name(0)
                 .into_bytes(),
         )?;
@@ -337,7 +528,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 .with_terminal_id(5)
                 .with_terminal_type(0x0201)
                 .with_associated_terminal_id(0)
-                .with_clock_source_id(2)
+                .with_clock_source_id(self.clocks[0].entity_id)
                 .with_num_channels(1)
                 .with_channel_config(ChannelConfig::new().with_channels(1))
                 .with_channel_names(0)
@@ -360,7 +551,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
 
         // Setup the speaker streaming
         //writer.iad(self.iface2, 1, 1 /* AUDIO */, 2 /* STREAMING */, 0)?;
-        writer.interface_alt(self.iface2, 0, 1, 2, 0x20, None)?;
+        /*writer.interface_alt(self.iface2, 0, 1, 2, 0x20, None)?;
         writer.interface_alt(
             self.iface2,
             1, /* alt */
@@ -401,7 +592,11 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
                 .into_bytes(),
         )?;
 
-        writer.endpoint(&self.data_feedback_ep)?;
+        //writer.endpoint(&self.data_feedback_ep)?;*/
+
+        for usb_source in self.stream_sources.iter() {
+            usb_source.write_stream_iface(writer)?;
+        }
 
         // Setup the microphone streaming
         writer.interface_alt(self.iface3, 0, 1, 2, 0x20, None)?;
@@ -451,7 +646,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
     fn get_alt_setting(&mut self, interface: InterfaceNumber) -> Option<u8> {
         let i: u8 = interface.into();
         log::info!("get_alt_setting(iface=0x{:x})", i);
-        if interface == self.iface2 {
+        if interface == self.stream_sources[0].iface {
             Some(self.alt_setting_2)
         } else if interface == self.iface3 {
             Some(self.alt_setting_3)
@@ -463,7 +658,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
     fn set_alt_setting(&mut self, interface: InterfaceNumber, alt: u8) -> bool {
         let i: u8 = interface.into();
         log::info!("set_alt_setting(iface=0x{:x}, alt={})", i, alt);
-        if interface == self.iface2 {
+        if interface == self.stream_sources[0].iface {
             self.alt_setting_2 = alt;
             true
         } else if interface == self.iface3 {
@@ -569,7 +764,7 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
             && req.request_type == usb_device::control::RequestType::Class
             && req.request == 1
             && req.value == 256
-            && req.index == 512
+            && req.index == 256
         {
             // Setting the Clock Valid control?
             //log::info!("{:?}", req.);
@@ -584,9 +779,9 @@ impl<'a, 'b, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B> for UsbA
     }
 
     fn endpoint_out(&mut self, addr: EndpointAddress) {
-        if self.data_ep.address().index() == addr.index() {
+        if self.stream_sources[0].endpoint.address().index() == addr.index() {
             let mut buf = [0; 768];
-            let nbytes = match self.data_ep.read(&mut buf) {
+            let nbytes = match self.stream_sources[0].endpoint.read(&mut buf) {
                 Ok(x) => x,
                 Err(e) => {
                     log::error!("Received error {:?}", e);

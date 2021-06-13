@@ -339,8 +339,16 @@ fn main() -> ! {
     let bus_adapter = support::new_bus_adapter();
     let bus = usb_device::bus::UsbBusAllocator::new(bus_adapter);
 
-    let clocks = [usbd_audio::ClockSource::new(2)];
-    let mut audio = UsbAudio::new(&bus, 768, &clocks);
+    let mut audio_allocator = usbd_audio::EntityAllocator::new(&bus);
+
+    let speaker_clock = audio_allocator.make_clock();
+    let speaker_usb_source = audio_allocator.make_usb_stream_source(&bus, &speaker_clock);
+    let speaker_sink = audio_allocator.make_external_audio_sink(&speaker_clock, &speaker_usb_source);
+
+    let clocks = [speaker_clock];
+    let input_streams = [speaker_usb_source];
+    let ext_sinks = [speaker_sink];
+    let mut audio = UsbAudio::new(&audio_allocator, &bus, 768, &clocks, &input_streams, &ext_sinks);
     let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(0x5824, 0x27dd))
         .product("imxrt-usbd")
         .max_packet_size_0(64)
@@ -406,9 +414,7 @@ fn main() -> ! {
     let mut i2s_underruns = 0;
     let mut i2s_usb_overruns = 0;
     let mut i2s_offset = 0;
-    let mut output_buffer: alloc::vec::Vec<u16> = vec![];
     let mut max_out_sample = 0;
-    let mut cached_audio_sample: Option<u32> = None;
     loop {
         loops += 1;
 
@@ -453,7 +459,7 @@ fn main() -> ! {
 
         time_elapse(&mut gpt1, || {
             // Note: GPT2 increments at 25M ticks per second (40ns/tick)
-            log::info!(
+            /*log::info!(
                 "{} RX'd = {} TX'd = {} blocks = {} dropped = {} loops = {} proctime = {} nsamps = {} filtered_samps = {} min/max={}/{} filtered range={}/{} I2S samps sent = {} underruns = {} overruns = {} max = {} pushed = {} popped = {}",
                 gpt2.count(), audio.nbytes, audio.nbytes_sent, blocks, samps_dropped, loops, last_processing_time, nsamps, filtered_samps, adc_min, adc_max, filtered_adc_min, filtered_adc_max, i2s_samps_sent, i2s_underruns, audio.usb_overruns, max_out_sample,
                 audio.samps.pushed, audio.samps.popped,
@@ -464,7 +470,7 @@ fn main() -> ! {
             );
             log::info!(
                 "{}", audio.clocks[0].entity_id,
-            );
+            );*/
             nsamps = 0;
             filtered_samps = 0;
             filtered_adc_min = 0.0;
@@ -508,67 +514,33 @@ fn main() -> ! {
             }
         }
 
-        /*if audio.samps.len() > 0 {
-            if output_buffer.len() < 512 {
-                for elem in audio.samps.iter() {
-                    // Twice: Once for each channel
-                    output_buffer.push(*elem);
-                    //output_buffer.push(*elem);
-                }
-                audio.samps = vec![];
-            } else {
-                //i2s_usb_overruns += 1;
-            }
-        }*/
-
-        if audio.feedback_flag {
+        /*if audio.feedback_flag {
             audio.feedback_flag = false;
             //let feedback = [0, 0xB0, 0];
-            let feedback = [0x66, 0x06, 0x0b];
+            //let feedback = [0x66, 0x06, 0x0b, 0x00];
+            //let feedback = 2890137u32.to_le_bytes(); // 16.16 format
+            let feedback = 722534u32.to_le_bytes(); // 10.14 format
             audio.data_feedback_ep.write(&feedback[..]);
-        }
+        }*/
 
         // Add data to the I2S FIFO
-        let mut n_added = 0;
         loop {
             let fifo_status = sai1.fifo_status();
             if fifo_status.error {
                 sai1.clear_fifo_error();
             }
-            if (!fifo_status.full) {
-                let processed_sample = match cached_audio_sample {
-                    Some(sample) => {
-                        sai1.push_sample(sample << 16);
-                        n_added += 1;
-                        i2s_samps_sent += 1;
-                        cached_audio_sample = None;
-                        true
-                    },
-                    None => {
-                        audio.samps.next(|sample: &[u16]| {
-                            if sample[0] > max_out_sample {
-                                max_out_sample = sample[0];
-                            }
-                            let left = sample[0] as i16 as f32 as i32 as u32;
-                            let right = sample[1] as i16 as f32 as i32 as u32;
-                            sai1.push_sample(left << 16);
-                            //sai1.push_sample(right << 16);
-                            n_added += 1;
-                            i2s_samps_sent += 1;
-                            cached_audio_sample = Some(right);
-                        })
+            if (fifo_status.count < 30) {
+                let processed_sample = audio.samps.next(|sample: &[u16]| {
+                    if sample[0] > max_out_sample {
+                        max_out_sample = sample[0];
                     }
-                };
-                //if output_buffer.len() > n_added {
-                if processed_sample {
-                    /*if output_buffer[n_added] > max_out_sample {
-                        max_out_sample = output_buffer[n_added];
-                    }
-                    let samp = output_buffer[n_added] as i16 as f32 as i32 as u32;
-                    sai1.push_sample(samp << 16);
-                    n_added += 1;
-                    i2s_samps_sent += 1;*/
-                } else {
+                    let left = sample[0] as i16 as f32 as i32 as u32;
+                    let right = sample[1] as i16 as f32 as i32 as u32;
+                    sai1.push_sample(left << 16);
+                    sai1.push_sample(right << 16);
+                    i2s_samps_sent += 1;
+                });
+                if !processed_sample {
                     //sai1.push_sample(0);
                     //sai1.push_sample(0);
                     i2s_underruns += 2;
@@ -579,9 +551,6 @@ fn main() -> ! {
             if (fifo_status.full) {
                 break;
             }
-        }
-        if output_buffer.len() >= n_added {
-            output_buffer.drain(..n_added);
         }
     }
 }
