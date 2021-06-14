@@ -345,10 +345,15 @@ fn main() -> ! {
     let speaker_usb_source = audio_allocator.make_usb_stream_source(&bus, &speaker_clock);
     let speaker_sink = audio_allocator.make_external_audio_sink(&speaker_clock, &speaker_usb_source);
 
+    let mic_source = audio_allocator.make_external_audio_source(&speaker_clock);
+    let mic_usb_sink = audio_allocator.make_usb_stream_sink(&bus, &mic_source, &speaker_clock);
+
     let clocks = [speaker_clock];
     let input_streams = [speaker_usb_source];
+    let output_streams = [mic_usb_sink];
     let ext_sinks = [speaker_sink];
-    let mut audio = UsbAudio::new(&audio_allocator, &bus, 768, &clocks, &input_streams, &ext_sinks);
+    let ext_sources = [mic_source];
+    let mut audio = UsbAudio::new(&audio_allocator, &bus, 768, &clocks, &input_streams, &output_streams, &ext_sinks, &ext_sources);
     let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(0x5824, 0x27dd))
         .product("imxrt-usbd")
         .max_packet_size_0(64)
@@ -459,7 +464,7 @@ fn main() -> ! {
 
         time_elapse(&mut gpt1, || {
             // Note: GPT2 increments at 25M ticks per second (40ns/tick)
-            /*log::info!(
+            log::info!(
                 "{} RX'd = {} TX'd = {} blocks = {} dropped = {} loops = {} proctime = {} nsamps = {} filtered_samps = {} min/max={}/{} filtered range={}/{} I2S samps sent = {} underruns = {} overruns = {} max = {} pushed = {} popped = {}",
                 gpt2.count(), audio.nbytes, audio.nbytes_sent, blocks, samps_dropped, loops, last_processing_time, nsamps, filtered_samps, adc_min, adc_max, filtered_adc_min, filtered_adc_max, i2s_samps_sent, i2s_underruns, audio.usb_overruns, max_out_sample,
                 audio.samps.pushed, audio.samps.popped,
@@ -470,7 +475,7 @@ fn main() -> ! {
             );
             log::info!(
                 "{}", audio.clocks[0].entity_id,
-            );*/
+            );
             nsamps = 0;
             filtered_samps = 0;
             filtered_adc_min = 0.0;
@@ -500,7 +505,7 @@ fn main() -> ! {
             } else {
                 mic_data.len()
             };
-            match audio.source_ep.write(&mic_data[..end]) {
+            match output_streams[0].endpoint.write(&mic_data[..end]) {
                 Ok(_) => {
                     mic_data = mic_data[end..].to_vec();
                 }
@@ -513,15 +518,6 @@ fn main() -> ! {
                 }
             }
         }
-
-        /*if audio.feedback_flag {
-            audio.feedback_flag = false;
-            //let feedback = [0, 0xB0, 0];
-            //let feedback = [0x66, 0x06, 0x0b, 0x00];
-            //let feedback = 2890137u32.to_le_bytes(); // 16.16 format
-            let feedback = 722534u32.to_le_bytes(); // 10.14 format
-            audio.data_feedback_ep.write(&feedback[..]);
-        }*/
 
         // Add data to the I2S FIFO
         loop {
