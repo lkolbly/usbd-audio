@@ -342,10 +342,20 @@ fn main() -> ! {
     let mut audio_allocator = usbd_audio::EntityAllocator::new(&bus);
 
     let speaker_clock = audio_allocator.make_clock();
-    let speaker_usb_source = audio_allocator.make_usb_stream_source(&bus, &speaker_clock);
+    let speaker_usb_source = audio_allocator.make_usb_stream_source(
+        &bus,
+        &speaker_clock,
+        usbd_audio::ChannelSet::new()
+            .with_spatial(usbd_audio::SpatialChannel::FrontLeft)
+            .with_spatial(usbd_audio::SpatialChannel::FrontRight)
+    );
     let speaker_sink = audio_allocator.make_external_audio_sink(&speaker_clock, &speaker_usb_source);
 
-    let mic_source = audio_allocator.make_external_audio_source(&speaker_clock);
+    let mic_source = audio_allocator.make_external_audio_source(
+        &speaker_clock,
+        usbd_audio::ChannelSet::new()
+            .with_spatial(usbd_audio::SpatialChannel::FrontLeft)
+    );
     let mic_usb_sink = audio_allocator.make_usb_stream_sink(&bus, &mic_source, &speaker_clock);
 
     let clocks = [speaker_clock];

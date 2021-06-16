@@ -6,9 +6,11 @@ extern crate alloc;
 use modular_bitfield::prelude::*;
 use usb_device::class_prelude::*;
 
+mod channels;
 mod control;
 mod descriptors;
 
+pub use crate::channels::*;
 use crate::control::*;
 use crate::descriptors::*;
 
@@ -113,12 +115,13 @@ impl EntityAllocator {
         &'audio self,
         alloc: &'usb usb_device::bus::UsbBusAllocator<B>,
         clock: &ClockSource<'audio>,
+        channels: ChannelSet,
     ) -> UsbStreamSource<'audio, 'usb, B> {
         let eid = self.next_eid();
         UsbStreamSource {
             entity_id: eid,
             clock_id: clock.entity_id,
-            channels: ChannelConfig::new().with_channels(3),
+            channels: channels,
             endpoint: alloc.isochronous(
                 IsochronousSynchronizationType::Adaptive,
                 IsochronousUsageType::Data,
@@ -164,11 +167,15 @@ impl EntityAllocator {
         }
     }
 
-    pub fn make_external_audio_source(&self, clock: &ClockSource) -> ExternalAudioSource {
+    pub fn make_external_audio_source(
+        &self,
+        clock: &ClockSource,
+        channels: ChannelSet,
+    ) -> ExternalAudioSource {
         ExternalAudioSource {
             entity_id: self.next_eid(),
             clock_id: clock.entity_id,
-            channels: ChannelConfig::new().with_channels(1),
+            channels: channels,
             _allocator: core::marker::PhantomData,
         }
     }
@@ -229,7 +236,7 @@ impl<'a> ControlEntity for ClockSource<'a> {
 pub struct UsbStreamSource<'audio, 'usb, B: usb_device::bus::UsbBus> {
     entity_id: u8,
     clock_id: u8,
-    channels: ChannelConfig,
+    channels: ChannelSet,
     endpoint: usb_device::endpoint::EndpointOut<'usb, B>,
     iface: InterfaceNumber,
     _allocator: core::marker::PhantomData<&'audio EntityAllocator>,
@@ -244,25 +251,26 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> AudioSourceEntity
 }
 
 impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSource<'audio, 'usb, B> {
-    fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
+    fn write_descriptor(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+    ) -> usb_device::Result<()> {
         let CS_INTERFACE = 0x24;
-        writer
-            .write(
-                CS_INTERFACE,
-                &InputTerminal::new()
-                    .with_subtype(Subtype::InputTerminal)
-                    .with_terminal_id(self.entity_id)
-                    .with_terminal_type(0x0101)
-                    .with_associated_terminal_id(0)
-                    .with_clock_source_id(self.clock_id)
-                    .with_num_channels(2) //self.channels.count())
-                    .with_channel_config(self.channels.clone())
-                    .with_channel_names(0)
-                    .with_controls(InputTerminalControls::new())
-                    .with_terminal(0)
-                    .into_bytes(),
-            )
-            .unwrap(); // TODO: Return error
+        writer.write(
+            CS_INTERFACE,
+            &InputTerminal::new()
+                .with_subtype(Subtype::InputTerminal)
+                .with_terminal_id(self.entity_id)
+                .with_terminal_type(0x0101)
+                .with_associated_terminal_id(0)
+                .with_clock_source_id(self.clock_id)
+                .with_num_channels(self.channels.count())
+                .with_channel_config(self.channels.config())
+                .with_channel_names(0)
+                .with_controls(InputTerminalControls::new())
+                .with_terminal(0)
+                .into_bytes(),
+        )
     }
 
     fn write_stream_iface(
@@ -284,8 +292,8 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSource<'audio, 'usb, B> 
                 .with_terminal_id(self.entity_id)
                 .with_format_type(FormatType::Type1)
                 .with_formats(Formats::new().with_pcm(true))
-                .with_num_channels(2) //self.channels.count())
-                .with_channel_config(self.channels.clone())
+                .with_num_channels(self.channels.count())
+                .with_channel_config(self.channels.config())
                 .with_channel_names(0)
                 .into_bytes(),
         )?;
@@ -322,22 +330,23 @@ pub struct UsbStreamSink<'audio, 'usb, B: usb_device::bus::UsbBus> {
 }
 
 impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSink<'audio, 'usb, B> {
-    fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
+    fn write_descriptor(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+    ) -> usb_device::Result<()> {
         let CS_INTERFACE = 0x24;
-        writer
-            .write(
-                CS_INTERFACE,
-                &OutputTerminal::new()
-                    .with_subtype(Subtype::OutputTerminal)
-                    .with_terminal_id(self.entity_id)
-                    .with_terminal_type(0x0101)
-                    .with_associated_terminal_id(0)
-                    .with_source_id(self.source_id)
-                    .with_clock_source_id(self.clock_id)
-                    .with_name(0)
-                    .into_bytes(),
-            )
-            .unwrap(); // TODO: Return error
+        writer.write(
+            CS_INTERFACE,
+            &OutputTerminal::new()
+                .with_subtype(Subtype::OutputTerminal)
+                .with_terminal_id(self.entity_id)
+                .with_terminal_type(0x0101)
+                .with_associated_terminal_id(0)
+                .with_source_id(self.source_id)
+                .with_clock_source_id(self.clock_id)
+                .with_name(0)
+                .into_bytes(),
+        )
     }
 
     fn write_stream_iface(
@@ -395,29 +404,30 @@ pub struct ExternalAudioSink<'audio> {
 }
 
 impl<'audio> ExternalAudioSink<'audio> {
-    fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
+    fn write_descriptor(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+    ) -> usb_device::Result<()> {
         let CS_INTERFACE = 0x24;
-        writer
-            .write(
-                CS_INTERFACE,
-                &OutputTerminal::new()
-                    .with_subtype(Subtype::OutputTerminal)
-                    .with_terminal_id(self.entity_id)
-                    .with_terminal_type(0x0301)
-                    .with_associated_terminal_id(0)
-                    .with_source_id(self.source_id)
-                    .with_clock_source_id(self.clock_id)
-                    .with_name(0)
-                    .into_bytes(),
-            )
-            .unwrap(); // TODO: Return error
+        writer.write(
+            CS_INTERFACE,
+            &OutputTerminal::new()
+                .with_subtype(Subtype::OutputTerminal)
+                .with_terminal_id(self.entity_id)
+                .with_terminal_type(0x0301)
+                .with_associated_terminal_id(0)
+                .with_source_id(self.source_id)
+                .with_clock_source_id(self.clock_id)
+                .with_name(0)
+                .into_bytes(),
+        )
     }
 }
 
 pub struct ExternalAudioSource<'audio> {
     entity_id: u8,
     clock_id: u8,
-    channels: ChannelConfig,
+    channels: ChannelSet,
     _allocator: core::marker::PhantomData<&'audio EntityAllocator>,
 }
 
@@ -428,25 +438,26 @@ impl<'audio> AudioSourceEntity for ExternalAudioSource<'audio> {
 }
 
 impl<'audio> ExternalAudioSource<'audio> {
-    fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
+    fn write_descriptor(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+    ) -> usb_device::Result<()> {
         let CS_INTERFACE = 0x24;
-        writer
-            .write(
-                CS_INTERFACE,
-                &InputTerminal::new()
-                    .with_subtype(Subtype::InputTerminal)
-                    .with_terminal_id(self.entity_id)
-                    .with_terminal_type(0x0201)
-                    .with_associated_terminal_id(0)
-                    .with_clock_source_id(self.clock_id)
-                    .with_num_channels(1) //self.channels.count()
-                    .with_channel_config(self.channels.clone())
-                    .with_channel_names(0)
-                    .with_controls(InputTerminalControls::new())
-                    .with_terminal(0)
-                    .into_bytes(),
-            )
-            .unwrap(); // TODO: Return error
+        writer.write(
+            CS_INTERFACE,
+            &InputTerminal::new()
+                .with_subtype(Subtype::InputTerminal)
+                .with_terminal_id(self.entity_id)
+                .with_terminal_type(0x0201)
+                .with_associated_terminal_id(0)
+                .with_clock_source_id(self.clock_id)
+                .with_num_channels(self.channels.count())
+                .with_channel_config(self.channels.config())
+                .with_channel_names(0)
+                .with_controls(InputTerminalControls::new())
+                .with_terminal(0)
+                .into_bytes(),
+        )
     }
 }
 

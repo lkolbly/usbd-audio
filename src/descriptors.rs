@@ -47,9 +47,10 @@ pub struct AudioClass {
 }
 
 #[bitfield]
-#[derive(BitfieldSpecifier, Clone)]
+#[derive(BitfieldSpecifier, Clone, Copy, Debug, PartialEq)]
 pub struct ChannelConfig {
-    pub channels: B32,
+    pub channels: B31,
+    pub raw: bool,
 }
 
 #[bitfield]
