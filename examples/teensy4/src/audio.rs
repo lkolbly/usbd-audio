@@ -358,12 +358,12 @@ fn main() -> ! {
     );
     let mic_usb_sink = audio_allocator.make_usb_stream_sink(&bus, &mic_source, &speaker_clock);
 
-    let clocks = [speaker_clock];
+    let controls: [&usbd_audio::ControlEntity<_>; 1] = [&speaker_clock];
     let input_streams = [speaker_usb_source];
     let output_streams = [mic_usb_sink];
     let ext_sinks = [speaker_sink];
     let ext_sources = [mic_source];
-    let mut audio = UsbAudio::new(&audio_allocator, &bus, 768, &clocks, &input_streams, &output_streams, &ext_sinks, &ext_sources);
+    let mut audio = UsbAudio::new(&audio_allocator, &bus, 768, &controls[..], &input_streams, &output_streams, &ext_sinks, &ext_sources);
     let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(0x5824, 0x27dd))
         .product("imxrt-usbd")
         .max_packet_size_0(64)
@@ -482,9 +482,6 @@ fn main() -> ! {
             log::info!(
                 "0x{:x}",
                 hal::ral::read_reg!(hal::ral::sai, sai1.regs(), TCSR)
-            );
-            log::info!(
-                "{}", audio.clocks[0].entity_id,
             );
             nsamps = 0;
             filtered_samps = 0;

@@ -73,11 +73,26 @@ impl<B: usb_device::bus::UsbBus> ControlReplyWriter for ControlIn<'_, '_, '_, B>
     }
 }
 
-trait ControlEntity {
+pub trait ControlEntity<B: usb_device::bus::UsbBus> {
     fn entity_id(&self) -> u8;
 
-    fn get_cur<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W);
-    fn get_range<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W);
+    fn write_descriptor(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+    ) -> usb_device::Result<()>;
+
+    fn get_cur(&self, control_selector: u8, reply_writer: ControlIn<'_, '_, '_, B>);
+    fn get_range(&self, control_selector: u8, reply_writer: ControlIn<'_, '_, '_, B>);
+}
+
+pub trait StreamableEntity {
+    fn write_stream_iface(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+    ) -> usb_device::Result<()>;
+
+    fn ep_out(&mut self, addr: EndpointAddress) -> usb_device::Result<bool>;
+    fn ep_in_complete(&mut self, addr: EndpointAddress) -> usb_device::Result<bool>;
 }
 
 /// Trait for entities which output audio
@@ -186,32 +201,31 @@ pub struct ClockSource<'a> {
     _lifetime: core::marker::PhantomData<&'a u8>,
 }
 
-impl<'a> ClockSource<'a> {
-    fn write_descriptor(&self, writer: &mut usb_device::descriptor::DescriptorWriter) {
-        let CS_INTERFACE = 0x24;
-        writer
-            .write(
-                CS_INTERFACE,
-                &descriptors::ClockSource::new()
-                    .with_subtype(Subtype::ClockSource)
-                    .with_clock_id(self.entity_id)
-                    .with_clock_type(ClockType::InternalFixed)
-                    .with_sync_to_sof(false)
-                    .with_associated_terminal_id(0)
-                    .with_name(0)
-                    .with_frequency(Control::ReadWrite)
-                    .into_bytes(),
-            )
-            .unwrap();
-    }
-}
-
-impl<'a> ControlEntity for ClockSource<'a> {
+impl<'a, B: usb_device::bus::UsbBus> ControlEntity<B> for ClockSource<'a> {
     fn entity_id(&self) -> u8 {
         self.entity_id
     }
 
-    fn get_cur<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W) {
+    fn write_descriptor(
+        &self,
+        writer: &mut usb_device::descriptor::DescriptorWriter,
+    ) -> usb_device::Result<()> {
+        let CS_INTERFACE = 0x24;
+        writer.write(
+            CS_INTERFACE,
+            &descriptors::ClockSource::new()
+                .with_subtype(Subtype::ClockSource)
+                .with_clock_id(self.entity_id)
+                .with_clock_type(ClockType::InternalFixed)
+                .with_sync_to_sof(false)
+                .with_associated_terminal_id(0)
+                .with_name(0)
+                .with_frequency(Control::ReadWrite)
+                .into_bytes(),
+        )
+    }
+
+    fn get_cur(&self, control_selector: u8, reply_writer: ControlIn<'_, '_, '_, B>) {
         if control_selector == 1 {
             // CS_SAM_FREQ_CONTROL
             reply_writer.layout3_cur(44_100);
@@ -220,7 +234,7 @@ impl<'a> ControlEntity for ClockSource<'a> {
         }
     }
 
-    fn get_range<W: ControlReplyWriter>(&self, control_selector: u8, reply_writer: W) {
+    fn get_range(&self, control_selector: u8, reply_writer: ControlIn<'_, '_, '_, B>) {
         if control_selector == 1 {
             reply_writer.layout3_range(&[ControlRange::<u32> {
                 min: 44100,
@@ -512,7 +526,7 @@ pub struct UsbAudio<'a, 'b, 'audio, B: usb_device::bus::UsbBus> {
     pub iface: usb_device::class_prelude::InterfaceNumber,
     pub alt_setting_2: u8,
     pub alt_setting_3: u8,
-    pub clocks: &'b [ClockSource<'audio>],
+    pub controls: &'b [&'b dyn ControlEntity<B>],
     pub stream_sources: &'b [UsbStreamSource<'audio, 'a, B>],
     pub stream_sinks: &'b [UsbStreamSink<'audio, 'a, B>],
     pub ext_audio_sinks: &'b [ExternalAudioSink<'audio>],
@@ -527,7 +541,7 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
         audio_alloc: &'audio EntityAllocator,
         alloc: &'a usb_device::bus::UsbBusAllocator<B>,
         max_packet_size: u16,
-        clocks: &'b [ClockSource<'audio>],
+        controls: &'b [&'b dyn ControlEntity<B>],
         stream_sources: &'b [UsbStreamSource<'audio, 'a, B>],
         stream_sinks: &'b [UsbStreamSink<'audio, 'a, B>],
         ext_audio_sinks: &'b [ExternalAudioSink<'audio>],
@@ -539,7 +553,7 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
             iface: audio_alloc.primary_iface,
             alt_setting_2: 0,
             alt_setting_3: 0,
-            clocks: clocks,
+            controls: controls,
             stream_sources: stream_sources,
             stream_sinks: stream_sinks,
             ext_audio_sinks: ext_audio_sinks,
@@ -582,7 +596,7 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
                 .with_spec_number_minor(2)
                 .with_category(0xff)
                 .with_total_length(
-                    (8 * self.clocks.len()
+                    (8 * self.controls.len()
                         + 17 * self.stream_sources.len()
                         + 17 * self.ext_audio_sources.len()
                         + 12 * self.stream_sinks.len()
@@ -592,7 +606,7 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
                 .into_bytes(),
         )?;
 
-        for clock in self.clocks.iter() {
+        for clock in self.controls.iter() {
             clock.write_descriptor(writer);
         }
         for usb_source in self.stream_sources.iter() {
@@ -668,7 +682,7 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
             let interface = req.index & 0xFF;
             let entity_id = req.index >> 8;
 
-            for control in self.clocks.iter() {
+            for control in self.controls.iter() {
                 if control.entity_id() == entity_id as u8 {
                     match reqtype {
                         ControlType::Range => {
