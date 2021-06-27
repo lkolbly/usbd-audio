@@ -133,6 +133,7 @@ impl EntityAllocator {
         channels: ChannelSet,
     ) -> UsbStreamSource<'audio, 'usb, B> {
         let eid = self.next_eid();
+        let nchannels = channels.count() as usize;
         UsbStreamSource {
             entity_id: eid,
             clock_id: clock.entity_id,
@@ -144,6 +145,8 @@ impl EntityAllocator {
                 1,
             ),
             iface: alloc.interface(),
+            samps: SampleBuffer::new(nchannels),
+            nbytes_read: 0,
             _allocator: core::marker::PhantomData,
         }
     }
@@ -253,6 +256,8 @@ pub struct UsbStreamSource<'audio, 'usb, B: usb_device::bus::UsbBus> {
     channels: ChannelSet,
     endpoint: usb_device::endpoint::EndpointOut<'usb, B>,
     iface: InterfaceNumber,
+    pub samps: SampleBuffer,
+    nbytes_read: usize,
     _allocator: core::marker::PhantomData<&'audio EntityAllocator>,
 }
 
@@ -291,6 +296,9 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSource<'audio, 'usb, B> 
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
     ) -> usb_device::Result<()> {
+        /*if self.entity_id == 4 {
+            return Ok(());
+        }*/
         let CS_INTERFACE = 0x24;
         writer.interface_alt(self.iface, 0, 1, 2, 0x20, None)?;
         writer.interface_alt(
@@ -331,6 +339,35 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSource<'audio, 'usb, B> 
                 .into_bytes(),
         )?;
         Ok(())
+    }
+
+    fn recv_data(&mut self) {
+        let mut buf = [0; 768];
+        let nbytes = match self.endpoint.read(&mut buf) {
+            Ok(x) => x,
+            Err(e) => {
+                log::error!("Received error {:?}", e);
+                return;
+            }
+        };
+        self.nbytes_read += nbytes;
+
+        let mut i = 0;
+        let nchannels = self.channels.count() as usize;
+        assert!(nchannels < 8);
+        while i < nbytes {
+            let mut samples: [u16; 8] = [0; 8];
+
+            for channel in 0..nchannels {
+                let hi = buf[i + 1];
+                let lo = buf[i];
+                let sample = ((hi as u16) << 8) | lo as u16;
+                samples[channel] = sample;
+                i += 2;
+            }
+
+            self.samps.push(&samples[0..nchannels]);
+        }
     }
 }
 
@@ -518,6 +555,10 @@ impl SampleBuffer {
         }
         true
     }
+
+    pub fn available(&self) -> usize {
+        self.buffer.len()
+    }
 }
 
 pub struct UsbAudio<'a, 'b, 'audio, B: usb_device::bus::UsbBus> {
@@ -526,14 +567,12 @@ pub struct UsbAudio<'a, 'b, 'audio, B: usb_device::bus::UsbBus> {
     pub iface: usb_device::class_prelude::InterfaceNumber,
     pub alt_setting_2: u8,
     pub alt_setting_3: u8,
-    pub controls: &'b [&'b dyn ControlEntity<B>],
-    pub stream_sources: &'b [UsbStreamSource<'audio, 'a, B>],
+    pub controls: &'b [&'b mut dyn ControlEntity<B>],
+    pub stream_sources: &'b mut [UsbStreamSource<'audio, 'a, B>],
     pub stream_sinks: &'b [UsbStreamSink<'audio, 'a, B>],
     pub ext_audio_sinks: &'b [ExternalAudioSink<'audio>],
     pub ext_audio_sources: &'b [ExternalAudioSource<'audio>],
-    pub samps: SampleBuffer,
     pub usb_overruns: usize,
-    pub feedback_flag: bool,
 }
 
 impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
@@ -541,8 +580,8 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
         audio_alloc: &'audio EntityAllocator,
         alloc: &'a usb_device::bus::UsbBusAllocator<B>,
         max_packet_size: u16,
-        controls: &'b [&'b dyn ControlEntity<B>],
-        stream_sources: &'b [UsbStreamSource<'audio, 'a, B>],
+        controls: &'b [&'b mut dyn ControlEntity<B>],
+        stream_sources: &'b mut [UsbStreamSource<'audio, 'a, B>],
         stream_sinks: &'b [UsbStreamSink<'audio, 'a, B>],
         ext_audio_sinks: &'b [ExternalAudioSink<'audio>],
         ext_audio_sources: &'b [ExternalAudioSource<'audio>],
@@ -558,9 +597,7 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
             stream_sinks: stream_sinks,
             ext_audio_sinks: ext_audio_sinks,
             ext_audio_sources: ext_audio_sources,
-            samps: SampleBuffer::new(2),
             usb_overruns: 0,
-            feedback_flag: false,
         }
     }
 }
@@ -579,8 +616,10 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
         USB OUT <--> Feature Unit <--> Microphone
         */
 
+        log::info!("Writing config descriptor");
+
         writer.iad(
-            self.iface, 3, 1, /* AUDIO */
+            self.iface, 4, 1, /* AUDIO */
             0, /* CONTROL */
             0x20,
         )?;
@@ -641,6 +680,8 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
         for usb_sink in self.stream_sinks.iter() {
             usb_sink.write_stream_iface(writer)?;
         }
+
+        log::info!("Writer position is {}", writer.position());
 
         Ok(())
     }
@@ -756,30 +797,11 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
     }
 
     fn endpoint_out(&mut self, addr: EndpointAddress) {
-        if self.stream_sources[0].endpoint.address().index() == addr.index() {
-            let mut buf = [0; 768];
-            let nbytes = match self.stream_sources[0].endpoint.read(&mut buf) {
-                Ok(x) => x,
-                Err(e) => {
-                    log::error!("Received error {:?}", e);
-                    return;
-                }
-            };
-            self.nbytes += nbytes;
-
-            for i in 0..nbytes / 4 {
-                let hi = buf[i * 4 + 1];
-                let lo = buf[i * 4];
-                let left = ((hi as u16) << 8) | lo as u16;
-
-                let hi = buf[i * 4 + 3];
-                let lo = buf[i * 4 + 2];
-                let right = ((hi as u16) << 8) | lo as u16;
-
-                self.samps.push(&[left, right]);
+        for source in self.stream_sources.iter_mut() {
+            if source.endpoint.address().index() == addr.index() {
+                source.recv_data();
+                break;
             }
-
-            self.feedback_flag = true;
         }
     }
 
