@@ -14,16 +14,17 @@
 #[macro_use]
 extern crate alloc;
 
+mod pfb;
+use pfb::PolyphaseFilterBank;
+
 use cortex_m_rt::interrupt;
 use embedded_hal::adc::OneShot;
 use support::bsp::interrupt;
 use support::bsp::t41;
 use support::hal;
 use support::hal::adc;
-use support::ral;
 
 use alloc_cortex_m::CortexMHeap;
-use micromath::F32Ext;
 use usb_device::class_prelude::*;
 use usb_device::prelude::*;
 use usbd_audio::UsbAudio;
@@ -52,153 +53,6 @@ fn DMA8_DMA24() {
         if let Some(adc) = &mut streaming_adc {
             adc.handle_interrupt();
         }
-    }
-}
-
-/// The ADC samples at 93696Hz, we want to output at 44100Hz
-/// So we need to resample at 1/2.1246, which we'll approximate with
-/// 1000/2125 or 8/17 (dividing out 125), giving us a true rate of ~44092Hz
-///
-/// For interpolation, we insert 7 zeroes after every sample, then we
-/// filter everything above Fs/16. The resulting sample rate Fsi = 749,568Hz
-///
-/// For decimation, we filter out everything above 20kHz (Fsi/38), and take
-/// every 17th sample.
-///
-/// For each output sample, we skip ahead 2 1/8th samples. Thus, with
-/// 8 filters, we consume 17 samples (2*8+8/8) and output 8 samples.
-///
-/// In general terms, with an N-tap filter M[0..N], output O[i] is:
-/// O[i] = sum(V[i-N+x] * M[x] for x in 0..N)
-/// V[i] = I[i/17] if i%17 == 0
-///      = 0 otherwise
-///
-/// Therefore, with N=50:
-/// O[0] = V[-50] * M[0] + V[-33] * M[17] + V[-16] * M[34]
-/// O[1] = ?
-struct PolyphaseFilterBank {
-    sample_offset: usize,
-    nsamps: usize,
-    raw_samples: [f32; 50],
-}
-
-const FILTER: [f32; 50] = [
-    -1.5571565755041362e-20,
-    5.299655672641262e-06,
-    3.729570824646748e-05,
-    0.00012457763600283632,
-    0.00030323871904505245,
-    0.0006182758531686576,
-    0.0011238702437696656,
-    0.0018821463770603017,
-    0.0029601834785402945,
-    0.004425282087467552,
-    0.006338740597132057,
-    0.008748640145754124,
-    0.011682338016292702,
-    0.015139500358883382,
-    0.019086542908262744,
-    0.02345328251739534,
-    0.028132434417186106,
-    0.03298233459649817,
-    0.03783294946319836,
-    0.04249489045854946,
-    0.046770818593343866,
-    0.050468341909227984,
-    0.0534133117654359,
-    0.055462336662509264,
-    0.05651336783135692,
-    0.05651336783135692,
-    0.05546233666250927,
-    0.05341331176543591,
-    0.050468341909227984,
-    0.04677081859334388,
-    0.04249489045854947,
-    0.03783294946319837,
-    0.032982334596498186,
-    0.028132434417186106,
-    0.023453282517395355,
-    0.019086542908262744,
-    0.015139500358883395,
-    0.011682338016292707,
-    0.008748640145754133,
-    0.006338740597132062,
-    0.00442528208746756,
-    0.002960183478540299,
-    0.0018821463770603017,
-    0.0011238702437696673,
-    0.0006182758531686576,
-    0.0003032387190450536,
-    0.0001245776360028364,
-    3.7295708246467734e-05,
-    5.299655672641164e-06,
-    -1.5571565755041362e-20,
-];
-
-impl PolyphaseFilterBank {
-    fn consume(&mut self, data: &[f32]) -> alloc::vec::Vec<f32> {
-        let mut result = vec![];
-        data.iter().for_each(|sample| {
-            self.raw_samples[(self.sample_offset + self.nsamps) % 50] = *sample;
-            self.nsamps = (self.nsamps + 1) % 50;
-            while self.nsamps >= 21 {
-                let mut i = [0.0; 21];
-                for idx in 0..21 {
-                    i[idx] = self.raw_samples[(self.sample_offset + idx) % 50];
-                }
-                self.nsamps -= 17;
-                self.sample_offset = (self.sample_offset + 17) % 50;
-                let chunk = self.compute(&i);
-                for elem in chunk.iter() {
-                    result.push(*elem);
-                }
-            }
-        });
-        result
-    }
-
-    fn compute(&self, I: &[f32; 21]) -> [f32; 8] {
-        let F = &FILTER;
-        let mut O = [0.0; 8];
-        O[0] =
-            I[0] * F[7] + I[1] * F[15] + I[2] * F[23] + I[3] * F[31] + I[4] * F[39] + I[5] * F[47];
-        O[1] =
-            I[2] * F[6] + I[3] * F[14] + I[4] * F[22] + I[5] * F[30] + I[6] * F[38] + I[7] * F[46];
-        O[2] =
-            I[4] * F[5] + I[5] * F[13] + I[6] * F[21] + I[7] * F[29] + I[8] * F[37] + I[9] * F[45];
-        O[3] = I[6] * F[4]
-            + I[7] * F[12]
-            + I[8] * F[20]
-            + I[9] * F[28]
-            + I[10] * F[36]
-            + I[11] * F[44];
-        O[4] = I[8] * F[3]
-            + I[9] * F[11]
-            + I[10] * F[19]
-            + I[11] * F[27]
-            + I[12] * F[35]
-            + I[13] * F[43];
-        O[5] = I[10] * F[2]
-            + I[11] * F[10]
-            + I[12] * F[18]
-            + I[13] * F[26]
-            + I[14] * F[34]
-            + I[15] * F[42];
-        O[6] = I[12] * F[1]
-            + I[13] * F[9]
-            + I[14] * F[17]
-            + I[15] * F[25]
-            + I[16] * F[33]
-            + I[17] * F[41]
-            + I[18] * F[49];
-        O[7] = I[14] * F[0]
-            + I[15] * F[8]
-            + I[16] * F[16]
-            + I[17] * F[24]
-            + I[18] * F[32]
-            + I[19] * F[40]
-            + I[20] * F[48];
-        O
     }
 }
 
@@ -339,41 +193,49 @@ fn main() -> ! {
     let bus_adapter = support::new_bus_adapter();
     let bus = usb_device::bus::UsbBusAllocator::new(bus_adapter);
 
-    let mut audio_allocator = usbd_audio::EntityAllocator::new(&bus);
+    let audio_allocator = usbd_audio::EntityAllocator::new(&bus);
 
     let mut speaker_clock = audio_allocator.make_clock();
-    let mut speaker_usb_source = audio_allocator.make_usb_stream_source(
+    let speaker_usb_source = audio_allocator.make_usb_stream_source(
         &bus,
         &speaker_clock,
         usbd_audio::ChannelSet::new()
             .with_spatial(usbd_audio::SpatialChannel::FrontLeft)
-            .with_spatial(usbd_audio::SpatialChannel::FrontRight)
+            .with_spatial(usbd_audio::SpatialChannel::FrontRight),
     );
-    let speaker_sink = audio_allocator.make_external_audio_sink(&speaker_clock, &speaker_usb_source);
+    let speaker_sink =
+        audio_allocator.make_external_audio_sink(&speaker_clock, &speaker_usb_source);
 
-    let mut speaker_usb_source2 = audio_allocator.make_usb_stream_source(
+    let speaker_usb_source2 = audio_allocator.make_usb_stream_source(
         &bus,
         &speaker_clock,
         usbd_audio::ChannelSet::new()
             .with_spatial(usbd_audio::SpatialChannel::FrontLeft)
-            .with_spatial(usbd_audio::SpatialChannel::FrontRight)
+            .with_spatial(usbd_audio::SpatialChannel::FrontRight),
     );
-    let speaker_sink2 = audio_allocator.make_external_audio_sink(&speaker_clock, &speaker_usb_source2);
+    let speaker_sink2 =
+        audio_allocator.make_external_audio_sink(&speaker_clock, &speaker_usb_source2);
 
     let mut mic_clock = audio_allocator.make_clock();
     let mic_source = audio_allocator.make_external_audio_source(
         &mic_clock,
-        usbd_audio::ChannelSet::new()
-            .with_spatial(usbd_audio::SpatialChannel::FrontLeft)
+        usbd_audio::ChannelSet::new().with_spatial(usbd_audio::SpatialChannel::FrontLeft),
     );
     let mic_usb_sink = audio_allocator.make_usb_stream_sink(&bus, &mic_source, &mic_clock);
 
-    let controls: [&mut usbd_audio::ControlEntity<_>; 2] = [&mut speaker_clock, &mut mic_clock];
+    let controls: [&mut dyn usbd_audio::ControlEntity<_>; 2] = [&mut speaker_clock, &mut mic_clock];
     let mut input_streams = [speaker_usb_source, speaker_usb_source2];
     let mut output_streams = [mic_usb_sink];
     let ext_sinks = [speaker_sink, speaker_sink2];
     let ext_sources = [mic_source];
-    let mut audio = UsbAudio::new(&audio_allocator, &bus, 768, &controls[..], &mut input_streams, &mut output_streams, &ext_sinks, &ext_sources);
+    let mut audio = UsbAudio::new(
+        &audio_allocator,
+        &controls[..],
+        &mut input_streams,
+        &mut output_streams,
+        &ext_sinks,
+        &ext_sources,
+    );
 
     let mut serial = usbd_serial::SerialPort::new(&bus);
 
@@ -399,24 +261,12 @@ fn main() -> ! {
 
     device.bus().configure();
     led.set();
-    /*let mut data = [0; 100];
-    for i in 0..100 {
-        let x = (i as f32).sin() * 127.;
-        let x = x as i8;
-        data[i] = x as u8;
-    }*/
 
     unsafe {
         streaming_adc.as_mut().unwrap().start();
     }
 
-    let mut pfb = PolyphaseFilterBank {
-        sample_offset: 0,
-        nsamps: 0,
-        raw_samples: [0.0; 50],
-    };
-
-    let mut n_sent = 1;
+    let mut pfb = PolyphaseFilterBank::new();
 
     log::info!("SAI version: {:?}", sai1.version());
     log::info!(
@@ -424,31 +274,26 @@ fn main() -> ! {
         hal::ral::read_reg!(hal::ral::sai, sai1.regs(), TCSR)
     );
 
-    let mut last_sent_bytes = 0;
     let mut loops = 0;
-    let mut update_countdown = 0;
     let mut adc_min = 0;
     let mut adc_max = 0;
     let mut filtered_adc_min: f32 = 0.0;
     let mut filtered_adc_max: f32 = 0.0;
-    let mut last_adc = 0;
     let mut nsamps = 0;
     let mut filtered_samps = 0;
     let mut last_processing_time = 0;
-    //let mut mic_data = vec![];
     let mut blocks = 0;
     let mut samps_dropped = 0;
     let mut i2s_samps_sent = 0;
     let mut i2s_underruns = 0;
     let mut i2s_usb_overruns = 0;
-    let mut i2s_offset = 0;
     let mut max_out_sample = 0;
     let mut fifo_size_hist: [u32; 32] = [0; 32];
     loop {
         loops += 1;
 
         {
-            let mut sadc = unsafe { streaming_adc.as_mut().unwrap() };
+            let sadc = unsafe { streaming_adc.as_mut().unwrap() };
             sadc.poll(|buf| {
                 let start = gpt2.count();
                 adc_min = *buf.iter().chain(core::iter::once(&adc_min)).min().unwrap();
@@ -468,12 +313,6 @@ fn main() -> ! {
                     if *samp > filtered_adc_max {
                         filtered_adc_max = *samp;
                     }
-                    /*if mic_data.len() < 1024 {
-                        let x = *samp * 10.0;
-                        mic_data.push(x as i8 as u8);
-                    } else {
-                        samps_dropped += 1;
-                    }*/
                     if audio.stream_sinks[0].samps.len() < 1024 {
                         let x = *samp * 10.0;
                         audio.stream_sinks[0].samps.push(x as i8 as u8);
@@ -495,9 +334,27 @@ fn main() -> ! {
         time_elapse(&mut gpt1, || {
             // Note: GPT2 increments at 25M ticks per second (40ns/tick)
 
-            let min_fifo_size = fifo_size_hist.iter().enumerate().filter(|(_,count)| **count > 0).map(|(idx, _)| idx).next().unwrap_or(0);
-            let max_fifo_size = fifo_size_hist.iter().enumerate().rev().filter(|(_,count)| **count > 0).map(|(idx, _)| idx).next().unwrap_or(0);
-            let median_fifo_size = fifo_size_hist.iter().enumerate().max_by_key(|(_, count)| *count).map(|(idx,_)| idx).unwrap_or(0);
+            let min_fifo_size = fifo_size_hist
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(idx, _)| idx)
+                .next()
+                .unwrap_or(0);
+            let max_fifo_size = fifo_size_hist
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, count)| **count > 0)
+                .map(|(idx, _)| idx)
+                .next()
+                .unwrap_or(0);
+            let median_fifo_size = fifo_size_hist
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, count)| *count)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
 
             log::info!(
                 "{} RX'd = {} TX'd = {} blocks = {} dropped = {} loops = {} proctime = {} nsamps = {} filtered_samps = {} min/max={}/{} filtered range={}/{} I2S samps sent = {} underruns = {} overruns = {} max = {}",
@@ -536,7 +393,7 @@ fn main() -> ! {
             max_out_sample = 0;
 
             match serial.write(b"Hello, world!\r\n") {
-                Ok(count) => {
+                Ok(_count) => {
                     //
                 }
                 Err(UsbError::WouldBlock) => {

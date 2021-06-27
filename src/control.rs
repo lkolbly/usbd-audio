@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use core::convert::TryInto;
-use modular_bitfield::prelude::*;
 use usb_device::class_prelude::*;
 
 #[derive(PartialEq, Debug)]

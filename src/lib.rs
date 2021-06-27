@@ -3,7 +3,6 @@
 #[macro_use]
 extern crate alloc;
 
-use modular_bitfield::prelude::*;
 use usb_device::class_prelude::*;
 
 mod channels;
@@ -13,6 +12,8 @@ mod descriptors;
 pub use crate::channels::*;
 use crate::control::*;
 use crate::descriptors::*;
+
+const CS_INTERFACE: u8 = 0x24;
 
 #[derive(PartialEq, Debug)]
 enum ControlType {
@@ -154,7 +155,7 @@ impl EntityAllocator {
     pub fn make_usb_stream_sink<'audio, 'usb, B: usb_device::bus::UsbBus>(
         &'audio self,
         alloc: &'usb usb_device::bus::UsbBusAllocator<B>,
-        source: &AudioSourceEntity,
+        source: &dyn AudioSourceEntity,
         clock: &ClockSource<'audio>,
     ) -> UsbStreamSink<'audio, 'usb, B> {
         UsbStreamSink {
@@ -177,7 +178,7 @@ impl EntityAllocator {
     pub fn make_external_audio_sink<'audio>(
         &'audio self,
         clock: &ClockSource<'audio>,
-        source: &AudioSourceEntity,
+        source: &dyn AudioSourceEntity,
     ) -> ExternalAudioSink<'audio> {
         ExternalAudioSink {
             entity_id: self.next_eid(),
@@ -215,7 +216,6 @@ impl<'a, B: usb_device::bus::UsbBus> ControlEntity<B> for ClockSource<'a> {
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
     ) -> usb_device::Result<()> {
-        let CS_INTERFACE = 0x24;
         writer.write(
             CS_INTERFACE,
             &descriptors::ClockSource::new()
@@ -276,7 +276,6 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSource<'audio, 'usb, B> 
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
     ) -> usb_device::Result<()> {
-        let CS_INTERFACE = 0x24;
         writer.write(
             CS_INTERFACE,
             &InputTerminal::new()
@@ -298,10 +297,6 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSource<'audio, 'usb, B> 
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
     ) -> usb_device::Result<()> {
-        /*if self.entity_id == 4 {
-            return Ok(());
-        }*/
-        let CS_INTERFACE = 0x24;
         writer.interface_alt(self.iface, 0, 1, 2, 0x20, None)?;
         writer.interface_alt(
             self.iface, 1, /* alt */
@@ -389,7 +384,6 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSink<'audio, 'usb, B> {
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
     ) -> usb_device::Result<()> {
-        let CS_INTERFACE = 0x24;
         writer.write(
             CS_INTERFACE,
             &OutputTerminal::new()
@@ -408,7 +402,6 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSink<'audio, 'usb, B> {
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
     ) -> usb_device::Result<()> {
-        let CS_INTERFACE = 0x24;
         writer.interface_alt(self.iface, 0, 1, 2, 0x20, None)?;
         writer.interface_alt(
             self.iface, 1, /* alt */
@@ -491,7 +484,6 @@ impl<'audio> ExternalAudioSink<'audio> {
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
     ) -> usb_device::Result<()> {
-        let CS_INTERFACE = 0x24;
         writer.write(
             CS_INTERFACE,
             &OutputTerminal::new()
@@ -525,7 +517,6 @@ impl<'audio> ExternalAudioSource<'audio> {
         &self,
         writer: &mut usb_device::descriptor::DescriptorWriter,
     ) -> usb_device::Result<()> {
-        let CS_INTERFACE = 0x24;
         writer.write(
             CS_INTERFACE,
             &InputTerminal::new()
@@ -610,8 +601,6 @@ pub struct UsbAudio<'a, 'b, 'audio, B: usb_device::bus::UsbBus> {
 impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
     pub fn new(
         audio_alloc: &'audio EntityAllocator,
-        alloc: &'a usb_device::bus::UsbBusAllocator<B>,
-        max_packet_size: u16,
         controls: &'b [&'b mut dyn ControlEntity<B>],
         stream_sources: &'b mut [UsbStreamSource<'audio, 'a, B>],
         stream_sinks: &'b mut [UsbStreamSink<'audio, 'a, B>],
@@ -662,7 +651,6 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
             0x20,
         )?;
         writer.interface(self.iface, 1 /* AUDIO */, 1 /* CONTROL */, 0x20)?;
-        let CS_INTERFACE = 0x24;
         // Setup the audio control
         // Clock sources are 8 bytes. Input terminals are 17. Output terminals are 12.
         writer.write(
@@ -684,19 +672,19 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
         )?;
 
         for clock in self.controls.iter() {
-            clock.write_descriptor(writer);
+            clock.write_descriptor(writer)?;
         }
         for usb_source in self.stream_sources.iter() {
-            usb_source.write_descriptor(writer);
+            usb_source.write_descriptor(writer)?;
         }
         for ext_audio_sink in self.ext_audio_sinks.iter() {
-            ext_audio_sink.write_descriptor(writer);
+            ext_audio_sink.write_descriptor(writer)?;
         }
         for usb_sink in self.stream_sinks.iter() {
-            usb_sink.write_descriptor(writer);
+            usb_sink.write_descriptor(writer)?;
         }
         for ext_audio_source in self.ext_audio_sources.iter() {
-            ext_audio_source.write_descriptor(writer);
+            ext_audio_source.write_descriptor(writer)?;
         }
 
         // Feature unit in Microphone path
