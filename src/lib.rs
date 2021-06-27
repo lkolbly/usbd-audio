@@ -168,6 +168,8 @@ impl EntityAllocator {
                 1,
             ),
             iface: alloc.interface(),
+            samps: vec![],
+            ready_to_send: true,
             _allocator: core::marker::PhantomData,
         }
     }
@@ -256,7 +258,7 @@ pub struct UsbStreamSource<'audio, 'usb, B: usb_device::bus::UsbBus> {
     channels: ChannelSet,
     endpoint: usb_device::endpoint::EndpointOut<'usb, B>,
     iface: InterfaceNumber,
-    pub samps: SampleBuffer,
+    pub samps: SampleBuffer<u16>,
     nbytes_read: usize,
     _allocator: core::marker::PhantomData<&'audio EntityAllocator>,
 }
@@ -377,6 +379,8 @@ pub struct UsbStreamSink<'audio, 'usb, B: usb_device::bus::UsbBus> {
     source_id: u8,
     pub endpoint: usb_device::endpoint::EndpointIn<'usb, B>,
     iface: InterfaceNumber,
+    pub samps: alloc::vec::Vec<u8>,
+    ready_to_send: bool,
     _allocator: core::marker::PhantomData<&'audio EntityAllocator>,
 }
 
@@ -445,6 +449,34 @@ impl<'audio, 'usb, B: usb_device::bus::UsbBus> UsbStreamSink<'audio, 'usb, B> {
         )?;
         Ok(())
     }
+
+    fn endpoint_in_complete(&mut self) {
+        self.ready_to_send = true;
+    }
+
+    fn poll(&mut self) {
+        if self.samps.len() > 45 {
+            let end = if self.samps.len() > 45 {
+                45
+            } else {
+                self.samps.len()
+            };
+            match self.endpoint.write(&self.samps[..end]) {
+                Ok(_) => {
+                    self.samps = self.samps[end..].to_vec();
+                }
+                Err(usb_device::UsbError::WouldBlock) => {
+                    // Would block, do nothing
+                    //blocks += 1;
+                    return;
+                }
+                Err(e) => {
+                    panic!("Endpoint send error {:?}", e);
+                }
+            }
+        }
+        self.ready_to_send = false;
+    }
 }
 
 pub struct ExternalAudioSink<'audio> {
@@ -512,14 +544,14 @@ impl<'audio> ExternalAudioSource<'audio> {
     }
 }
 
-pub struct SampleBuffer {
+pub struct SampleBuffer<Sample: Copy> {
     channels: usize,
-    buffer: alloc::vec::Vec<u16>,
+    buffer: alloc::vec::Vec<Sample>,
     pub pushed: usize,
     pub popped: usize,
 }
 
-impl SampleBuffer {
+impl<Sample: Copy> SampleBuffer<Sample> {
     pub fn new(channels: usize) -> Self {
         SampleBuffer {
             channels,
@@ -529,7 +561,7 @@ impl SampleBuffer {
         }
     }
 
-    pub fn push(&mut self, sample: &[u16]) {
+    pub fn push(&mut self, sample: &[Sample]) {
         assert!(sample.len() == self.channels);
         if self.buffer.len() >= 512 {
             // Overflow
@@ -542,7 +574,7 @@ impl SampleBuffer {
         }
     }
 
-    pub fn next<F: FnOnce(&[u16])>(&mut self, cb: F) -> bool {
+    pub fn next<F: FnOnce(&[Sample])>(&mut self, cb: F) -> bool {
         if self.buffer.len() == 0 {
             return false;
         }
@@ -569,7 +601,7 @@ pub struct UsbAudio<'a, 'b, 'audio, B: usb_device::bus::UsbBus> {
     pub alt_setting_3: u8,
     pub controls: &'b [&'b mut dyn ControlEntity<B>],
     pub stream_sources: &'b mut [UsbStreamSource<'audio, 'a, B>],
-    pub stream_sinks: &'b [UsbStreamSink<'audio, 'a, B>],
+    pub stream_sinks: &'b mut [UsbStreamSink<'audio, 'a, B>],
     pub ext_audio_sinks: &'b [ExternalAudioSink<'audio>],
     pub ext_audio_sources: &'b [ExternalAudioSource<'audio>],
     pub usb_overruns: usize,
@@ -582,7 +614,7 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
         max_packet_size: u16,
         controls: &'b [&'b mut dyn ControlEntity<B>],
         stream_sources: &'b mut [UsbStreamSource<'audio, 'a, B>],
-        stream_sinks: &'b [UsbStreamSink<'audio, 'a, B>],
+        stream_sinks: &'b mut [UsbStreamSink<'audio, 'a, B>],
         ext_audio_sinks: &'b [ExternalAudioSink<'audio>],
         ext_audio_sources: &'b [ExternalAudioSource<'audio>],
     ) -> Self {
@@ -598,6 +630,12 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> UsbAudio<'a, 'b, 'audio, B> {
             ext_audio_sinks: ext_audio_sinks,
             ext_audio_sources: ext_audio_sources,
             usb_overruns: 0,
+        }
+    }
+
+    pub fn poll(&mut self) {
+        for sink in self.stream_sinks.iter_mut() {
+            sink.poll();
         }
     }
 }
@@ -807,5 +845,11 @@ impl<'a, 'b, 'audio, B: usb_device::bus::UsbBus> usb_device::class::UsbClass<B>
 
     fn endpoint_in_complete(&mut self, addr: EndpointAddress) {
         self.nbytes_sent += 45;
+        for sink in self.stream_sinks.iter_mut() {
+            if sink.endpoint.address().index() == addr.index() {
+                sink.endpoint_in_complete();
+                break;
+            }
+        }
     }
 }

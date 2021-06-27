@@ -370,10 +370,10 @@ fn main() -> ! {
 
     let controls: [&mut usbd_audio::ControlEntity<_>; 2] = [&mut speaker_clock, &mut mic_clock];
     let mut input_streams = [speaker_usb_source, speaker_usb_source2];
-    let output_streams = [mic_usb_sink];
+    let mut output_streams = [mic_usb_sink];
     let ext_sinks = [speaker_sink, speaker_sink2];
     let ext_sources = [mic_source];
-    let mut audio = UsbAudio::new(&audio_allocator, &bus, 768, &controls[..], &mut input_streams, &output_streams, &ext_sinks, &ext_sources);
+    let mut audio = UsbAudio::new(&audio_allocator, &bus, 768, &controls[..], &mut input_streams, &mut output_streams, &ext_sinks, &ext_sources);
 
     let mut serial = usbd_serial::SerialPort::new(&bus);
 
@@ -435,7 +435,7 @@ fn main() -> ! {
     let mut nsamps = 0;
     let mut filtered_samps = 0;
     let mut last_processing_time = 0;
-    let mut mic_data = vec![];
+    //let mut mic_data = vec![];
     let mut blocks = 0;
     let mut samps_dropped = 0;
     let mut i2s_samps_sent = 0;
@@ -468,9 +468,15 @@ fn main() -> ! {
                     if *samp > filtered_adc_max {
                         filtered_adc_max = *samp;
                     }
-                    if mic_data.len() < 1024 {
+                    /*if mic_data.len() < 1024 {
                         let x = *samp * 10.0;
                         mic_data.push(x as i8 as u8);
+                    } else {
+                        samps_dropped += 1;
+                    }*/
+                    if audio.stream_sinks[0].samps.len() < 1024 {
+                        let x = *samp * 10.0;
+                        audio.stream_sinks[0].samps.push(x as i8 as u8);
                     } else {
                         samps_dropped += 1;
                     }
@@ -549,6 +555,7 @@ fn main() -> ! {
         if !device.poll(&mut [&mut audio, &mut serial]) {
             //continue;
         }
+        audio.poll();
 
         let mut buf = [0u8; 64];
         match serial.read(&mut buf[..]) {
@@ -560,26 +567,6 @@ fn main() -> ! {
             }
             Err(err) => {
                 log::error!("Got serial error {:?}", err);
-            }
-        }
-
-        if mic_data.len() > 45 {
-            let end = if mic_data.len() > 45 {
-                45
-            } else {
-                mic_data.len()
-            };
-            match output_streams[0].endpoint.write(&mic_data[..end]) {
-                Ok(_) => {
-                    mic_data = mic_data[end..].to_vec();
-                }
-                Err(usb_device::UsbError::WouldBlock) => {
-                    // Would block, do nothing
-                    blocks += 1;
-                }
-                Err(e) => {
-                    panic!("Endpoint send error {:?}", e);
-                }
             }
         }
 
