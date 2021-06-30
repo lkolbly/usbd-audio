@@ -1,0 +1,6 @@
+[submodule "libs/usb-device"]
+	path = libs/usb-device
+	url = https://github.com/lkolbly/usb-device.git
+[submodule "libs/imxrt-hal"]
+	path = libs/imxrt-hal
+	url = https://github.com/lkolbly/imxrt-hal.git

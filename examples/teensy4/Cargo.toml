@@ -41,7 +41,7 @@ version = "0.6.13"
 # USB device
 [dependencies.usb-device]
 version = "0.2"
-features = [ "control-buffer-256" ]
+features = [ "control-buffer-512" ]
 
 # USB CDC class
 [dependencies.usbd-serial]
@@ -75,8 +75,5 @@ name = "support"
 path = "src/support.rs"
 
 [patch.crates-io]
-usb-device = { path = "../../../usb-device" }
-imxrt-hal = { path = "../../../imxrt-hal/imxrt-hal" }
-imxrt-ral = { path = "../../../imxrt-ral" }
-#teensy4-bsp = { path = "../../../teensy4-rs" }
-imxrt-iomuxc = { path = "../../../imxrt-iomuxc" }
+usb-device = { path = "../../libs/usb-device" }
+imxrt-hal = { path = "../../libs/imxrt-hal/imxrt-hal" }
