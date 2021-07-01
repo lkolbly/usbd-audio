@@ -4,3 +4,6 @@
 [submodule "libs/imxrt-hal"]
 	path = libs/imxrt-hal
 	url = https://github.com/lkolbly/imxrt-hal.git
+[submodule "libs/imxrt-usbd"]
+	path = libs/imxrt-usbd
+	url = https://github.com/lkolbly/imxrt-usbd

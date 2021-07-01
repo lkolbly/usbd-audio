@@ -10,7 +10,7 @@ publish = false  # This is an example package
 path = "../../"
 
 [dependencies.imxrt-usbd]
-path = "../../../imxrt-usbd"
+path = "../../libs/imxrt-usbd"
 features = [
     # "__log"  # Only for driver development and debugging
 ]
